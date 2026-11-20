@@ -1,0 +1,135 @@
+import { describe, expect, it } from 'vitest';
+import { col, count, max, mean, min, sum, table, variance } from '../src/index.js';
+
+describe('query execution', () => {
+  const source = table([
+    { speed: 120, rpm: 3000, mode: 'sport' },
+    { speed: 80, rpm: 2000, mode: 'eco' },
+    { speed: 140, rpm: 4500, mode: 'sport' },
+    { speed: null, rpm: 2500, mode: 'eco' },
+  ]);
+
+  it('filters and projects without changing row order', () => {
+    const result = source
+      .query()
+      .filter(col('speed').gt(100).and(col('rpm').lt(4000)))
+      .select('speed', 'mode')
+      .execute();
+
+    expect(result.toRows()).toEqual([{ speed: 120, mode: 'sport' }]);
+  });
+
+  it('composes OR, NOT, equality and null predicates', () => {
+    const result = source
+      .query()
+      .filter(col('mode').eq('eco').or(col('speed').isNull()).not())
+      .execute();
+
+    expect(result.rowCount).toBe(2);
+  });
+
+  it('validates aggregate inputs against an explicit projection', () => {
+    expect(() =>
+      source
+        .query()
+        .select('speed')
+        .aggregate({ average: mean('rpm') }),
+    ).toThrow(/references unselected column 'rpm'/);
+  });
+
+  it('fuses filtering and aggregation into a single table traversal', () => {
+    const result = source
+      .query()
+      .filter(col('speed').gte(100))
+      .aggregate({
+        total: sum('speed'),
+        average: mean('speed'),
+        minimum: min('speed'),
+        maximum: max('speed'),
+        rows: count(),
+        present: count('speed'),
+        spread: variance('speed'),
+      })
+      .execute();
+
+    expect(result).toEqual({
+      total: 260,
+      average: 130,
+      minimum: 120,
+      maximum: 140,
+      rows: 2,
+      present: 2,
+      spread: 100,
+    });
+  });
+
+  it('preserves low-order terms during large-magnitude cancellation', () => {
+    const values = new Float64Array([1e16, 1, -1e16]);
+    const singleAggregate = table({ value: values })
+      .query()
+      .aggregate({ total: sum('value') })
+      .execute();
+    const fusedAggregates = table({ value: values })
+      .query()
+      .aggregate({ total: sum('value'), rows: count() })
+      .execute();
+
+    expect(singleAggregate['total']).toBe(1);
+    expect(fusedAggregates['total']).toBe(1);
+  });
+
+  it('uses population variance by default and supports sample variance', () => {
+    const result = table([{ value: 1 }, { value: 2 }, { value: 3 }])
+      .query()
+      .aggregate({ population: variance('value'), sample: variance('value', true) })
+      .execute();
+
+    expect(result['population']).toBeCloseTo(2 / 3);
+    expect(result['sample']).toBe(1);
+  });
+
+  it('returns null for empty numeric aggregates and zero for count', () => {
+    const result = table([{ value: null }])
+      .query()
+      .aggregate({
+        total: sum('value'),
+        average: mean('value'),
+        rows: count(),
+        present: count('value'),
+      })
+      .execute();
+
+    expect(result).toEqual({ total: null, average: null, rows: 1, present: 0 });
+  });
+
+  it('supports dictionary and boolean columns in count', () => {
+    const result = table([
+      { mode: 'eco', active: true },
+      { mode: null, active: false },
+    ])
+      .query()
+      .aggregate({ modes: count('mode'), active: count('active') })
+      .execute();
+
+    expect(result).toEqual({ modes: 1, active: 2 });
+  });
+
+  it('rejects numeric aggregation over dictionary columns', () => {
+    expect(() =>
+      table([{ mode: 'eco' }])
+        .query()
+        .aggregate({ total: sum('mode') })
+        .execute(),
+    ).toThrow(/requires a numeric column/);
+  });
+
+  it('checks abort signals during execution', () => {
+    const controller = new AbortController();
+
+    controller.abort();
+
+    expect(() =>
+      source.query().aggregate({ rows: count() }, { signal: controller.signal }).execute(),
+    ).toThrow(/aborted/);
+  });
+});

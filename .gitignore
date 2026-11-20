@@ -1,4 +1,3 @@
-# Dependencies
 node_modules/
 .pnpm-store/
 vendor/
@@ -28,3 +27,6 @@ out/
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
+
+# Benchmark output
+benchmarks/results/

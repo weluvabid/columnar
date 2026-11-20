@@ -22,6 +22,8 @@ export default tseslint.config(
       '**/dist/**',
       '**/build/**',
       '**/target/**',
+      '**/benchmarks/**',
+      '**/examples/**',
     ],
   },
   eslint.configs.recommended,

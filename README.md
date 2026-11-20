@@ -1,76 +1,190 @@
-# OSS Repository Template
+# Columnar
 
-A small, reusable baseline for independent open-source repositories.
+**A typed-array-native data processing engine for JavaScript and TypeScript.**
 
-This repository contains language-agnostic repository hygiene plus optional tooling profiles.
+Columnar keeps tabular data in contiguous typed-array buffers, compiles predicates once per execution, and runs filtered aggregations in a fused traversal. It is designed for application workloads that need fast in-process analytics without converting every row into an intermediate object.
 
-## What's included
+```ts
+import { col, count, mean, sum, table } from '@columnar/core';
 
-### Core
-- EditorConfig defaults.
-- General-purpose Git ignore rules.
-- Conventional Commit message validation.
-- A Git hook installer that respects an existing `core.hooksPath`.
-- Pull request and contribution templates.
-- Guidance for branch protection and repository setup.
+const vehicles = table({
+  timestamp: new Float64Array([0, 10, 20, 30]),
+  speed: new Float32Array([120, 80, 140, 110]),
+  rpm: new Uint16Array([3_100, 2_400, 4_200, 3_600]),
+});
 
-### Optional profiles
-- `profiles/node-pnpm/` — Node.js + pnpm CI, formatting, linting, and hook conventions.
-- `profiles/typescript/` — ESLint flat config and Prettier defaults for JS/TS projects.
+const result = vehicles
+  .query()
+  .filter(col('speed').gte(100).and(col('rpm').lt(4_000)))
+  .aggregate({
+    observations: count(),
+    totalSpeed: sum('speed'),
+    averageSpeed: mean('speed'),
+  })
+  .execute();
 
-Profiles are reference files. Copy only the files a project actually needs; do not blindly install every profile.
+console.log(result);
+// { observations: 2, totalSpeed: 230, averageSpeed: 115 }
+```
 
-## Create a repository from this template
+## What it provides
 
-1. Create a public GitHub repository named `oss-template`.
-2. Push the contents of this repository to its `main` branch.
-3. Open **Settings → General → Template repository** and enable **Template repository**.
-4. For a new project, select **Use this template → Create a new repository**.
-5. Choose the owner, repository name, visibility, and create it.
+- Typed-array-backed numeric columns with zero-copy typed-array ingestion.
+- Dictionary-encoded string columns.
+- Bit-packed validity maps for nullable values.
+- Boolean columns stored as bytes.
+- Composable predicates with `and`, `or`, and `not`.
+- Fused filtering and aggregation without intermediate row objects or filtered tables.
+- Neumaier compensated summation, online mean, and Welford population/sample variance.
+- Chunk-at-a-time asynchronous aggregation with upstream backpressure.
+- ESM output and TypeScript declarations, with no runtime dependencies.
 
-A repository created from a GitHub template gets its own history. It does not retrofit existing repositories.
-
-## Adopt the core hooks
-
-The core hook installer is a shell script and does not require Node.js:
+## Install
 
 ```sh
-sh scripts/install-hooks.sh
+pnpm add @columnar/core
 ```
 
-It configures Git to use `.githooks/`.
+## Input
 
-The `commit-msg` hook enforces this Conventional Commit subject format:
+### Column-oriented input
 
-```text
-type(scope): imperative description
+Use typed arrays for the direct columnar path. Typed-array inputs are retained by reference; the table and caller share their backing buffers.
+
+```ts
+import { table } from '@columnar/core';
+
+const dataset = table({
+  timestamp: new Float64Array([0, 10, 20]),
+  temperature: new Float32Array([21.5, 22.1, 21.9]),
+  sample: new Uint32Array([1, 2, 3]),
+});
 ```
 
-Examples:
+### Row-oriented input
 
-```text
-feat(cache): add weighted eviction
-fix(shell): preserve focus after navigation
-docs: explain local development
-chore: update repository tooling
+Ordinary records are accepted and converted to column storage once at ingestion.
+
+```ts
+const dataset = table([
+  { city: 'Pune', temperature: 28.5, active: true },
+  { city: 'Chennai', temperature: 31.2, active: false },
+]);
 ```
 
-Allowed types are `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, and `revert`.
+Numeric arrays become `Float64Array` columns, booleans become byte columns, and strings become dictionary-encoded columns. `null` and `undefined` values are represented by a validity bitmap. A column containing only null values is represented as a nullable numeric column.
 
-## Adopt an optional profile
+## Queries
 
-Read the profile's `README.md` before copying files. Each profile documents:
-- Which files to copy.
-- Required development dependencies.
-- Required package scripts.
-- What is intentionally excluded.
+### Filter and project
 
-## Repository setup after creation
+```ts
+const fastVehicles = dataset
+  .query()
+  .filter(col('temperature').gt(25))
+  .select('city', 'temperature')
+  .execute();
+```
 
-Recommended baseline:
-- Protect `main`; require pull requests and passing CI before merge.
-- Require branches to be up to date if the project benefits from strict merge validation.
-- Enable Dependabot only for ecosystems the project actually uses.
-- Keep Actions permissions read-only by default; grant write permissions per job.
-- Pin third-party GitHub Actions to full commit SHAs and retain a version comment.
-- Keep release and deployment workflows out of the baseline unless the project needs them.
+`select` returns a table containing references to the selected columns. Filtering creates compact output buffers for the selected columns.
+
+### Aggregation
+
+```ts
+import { count, max, mean, min, sum, variance } from '@columnar/core';
+
+const summary = dataset
+  .query()
+  .filter(col('temperature').gte(20))
+  .aggregate({
+    samples: count(),
+    validTemperatures: count('temperature'),
+    total: sum('temperature'),
+    average: mean('temperature'),
+    minimum: min('temperature'),
+    maximum: max('temperature'),
+    populationVariance: variance('temperature'),
+    sampleVariance: variance('temperature', true),
+  })
+  .execute();
+```
+
+Supported aggregates are `count`, `sum`, `mean`, `min`, `max`, and `variance`. Numeric aggregates skip nulls. `count()` counts rows; `count(column)` counts non-null values. Empty numeric aggregates return `null`. Variance is population variance by default; pass `true` for sample variance.
+
+### Predicates
+
+```ts
+const predicate = col('temperature')
+  .gte(20)
+  .and(col('city').ne('Pune'))
+  .or(col('temperature').isNull());
+```
+
+Available comparisons: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `isNull`, and `isNotNull`. Comparisons involving null evaluate to false; use the explicit null predicates to test missing values.
+
+## Streaming aggregation
+
+`aggregateStream` consumes an `AsyncIterable<Table>` one chunk at a time. It retains aggregate state, not prior chunks, and requests the next chunk only after processing the current one.
+
+```ts
+import { aggregateStream, count, mean, sum, table } from '@columnar/core';
+
+async function* readBatches() {
+  yield table({ temperature: new Float32Array([21.5, 27.2, 29.1]) });
+  yield table({ temperature: new Float32Array([24.8, 31.4, 26.3]) });
+}
+
+const result = await aggregateStream(readBatches(), {
+  rows: count(),
+  total: sum('temperature'),
+  average: mean('temperature'),
+});
+```
+
+An optional `where` predicate filters rows per chunk, and an optional `AbortSignal` cancels processing:
+
+```ts
+const abortController = new AbortController();
+
+const result = await aggregateStream(
+  readBatches(),
+  { average: mean('temperature') },
+  {
+    where: col('temperature').gt(25),
+    signal: abortController.signal,
+  },
+);
+```
+
+## Memory model
+
+| Input               | Representation                                            |
+| ------------------- | --------------------------------------------------------- |
+| Numeric typed array | Original typed array, retained by reference               |
+| Numeric JS array    | `Float64Array`                                            |
+| Boolean values      | `Uint8Array`                                              |
+| Strings             | `Uint32Array` dictionary indices plus a string dictionary |
+| Nullability         | Optional `Uint32Array` validity bitmap (one bit per row)  |
+
+The direct typed-array path is zero-copy. Mutations to a caller-owned typed array are visible to the table. Do not mutate shared input buffers while a query is executing.
+
+A fused aggregate query allocates aggregate state proportional to the number of requested aggregates. It does not allocate an intermediate result table. A filtered table query allocates a selection index buffer and compact output buffers. Streaming aggregation retains only the current input chunk and aggregate state.
+
+## Development
+
+Requires Node.js 26.13.0 and pnpm 12.0.0.
+
+```sh
+pnpm install
+pnpm check
+pnpm bench
+pnpm bench -- --large
+```
+
+`pnpm check` runs type checking, ESLint, Prettier validation, tests, and the package build. The benchmark compares the fused Columnar query with a native typed-array loop and a materializing JavaScript pipeline. Run benchmarks on an otherwise idle machine using the same Node.js build for repeatable comparisons.
+
+Each example can be opened as a StackBlitz project after `@columnar/core` is published to npm.
+
+## License
+
+MIT

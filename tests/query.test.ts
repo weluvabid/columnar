@@ -63,6 +63,40 @@ describe('query execution', () => {
     expect(selectedRows[8_975]).toEqual({ value: 1 });
   });
 
+  it('preserves nulls and row order for dense selections', () => {
+    const size = 10_000;
+    const ids = new Int32Array(size);
+    const scores = new Float64Array(size);
+    const labels = new Array<string | null>(size);
+
+    for (let index = 0; index < size; index += 1) {
+      ids[index] = index;
+      scores[index] = index;
+      labels[index] = index % 7 === 0 ? null : `label-${index % 3}`;
+    }
+
+    const result = table({
+      ids,
+      scores,
+      labels,
+      c3: ids,
+      c4: ids,
+      c5: ids,
+      c6: ids,
+      c7: ids,
+    })
+      .query()
+      .filter(col('ids').gte(1_000))
+      .select('ids', 'labels')
+      .execute();
+
+    expect(result.rowCount).toBe(9_000);
+    expect(result.columnNames).toEqual(['ids', 'labels']);
+    expect(result.toRows()[0]).toEqual({ ids: 1_000, labels: 'label-1' });
+    expect(result.toRows()[8]).toEqual({ ids: 1_008, labels: null });
+    expect(result.toRows()[8_999]).toEqual({ ids: 9_999, labels: 'label-0' });
+  });
+
   it('uses sampled selectivity to size sparse selection buffers', () => {
     const values = new Float64Array(10_000);
 
@@ -123,6 +157,41 @@ describe('query execution', () => {
     });
   });
 
+  it('shares one numeric column read across multiple aggregate states', () => {
+    const values = table({
+      metric: [1, 2, 3, 4, 5, null],
+      weight: [10, 20, 30, 40, 50, 60],
+    });
+
+    expect(
+      values
+        .query()
+        .filter(col('weight').gte(20))
+        .aggregate({
+          total: sum('metric'),
+          average: mean('metric'),
+          minimum: min('metric'),
+          maximum: max('metric'),
+          spread: variance('metric'),
+          weightTotal: sum('weight'),
+          weightAverage: mean('weight'),
+          present: count('metric'),
+          rows: count(),
+        })
+        .execute(),
+    ).toEqual({
+      total: 14,
+      average: 3.5,
+      minimum: 2,
+      maximum: 5,
+      spread: 1.25,
+      weightTotal: 200,
+      weightAverage: 40,
+      present: 4,
+      rows: 5,
+    });
+  });
+
   it('uses flattened numeric predicates with correct comparison and null semantics', () => {
     const values = table({
       first: [1, 2, 3, 4, null],
@@ -152,6 +221,16 @@ describe('query execution', () => {
         .aggregate({ total: sum('first') })
         .execute(),
     ).toEqual({ total: 10 });
+  });
+
+  it('returns empty identities for null equality in multi-aggregate execution', () => {
+    const result = table({ value: [1, 2, null] })
+      .query()
+      .filter(col('value').eq(null))
+      .aggregate({ total: sum('value'), rows: count(), present: count('value') })
+      .execute();
+
+    expect(result).toEqual({ total: null, rows: 0, present: 0 });
   });
 
   it('preserves JavaScript comparison semantics for NaN predicates', () => {

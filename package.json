@@ -54,7 +54,8 @@
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build",
     "precommit": "pnpm lint && pnpm format:check && pnpm test",
     "prepare": "sh ./scripts/install-hooks.sh",
-    "prepack": "pnpm build"
+    "prepack": "pnpm build",
+    "bench:advanced": "node --expose-gc --import tsx benchmarks/advanced.ts"
   },
   "devDependencies": {
     "@eslint/js": "9.39.1",

@@ -15,7 +15,7 @@ Public API
                                Column buffers
 ```
 
-The public API is intentionally small. `Table` owns the schema and column references. `Predicate` is an immutable expression tree. Query execution binds referenced columns before entering the row loop, avoiding repeated schema-map lookups for each value.
+`Table` owns the schema and column references. `Predicate` is an immutable expression tree. Query execution binds referenced columns before entering the row loop, avoiding repeated schema-map lookups for each value.
 
 ## Storage
 

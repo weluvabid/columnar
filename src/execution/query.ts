@@ -58,19 +58,40 @@ export class QueryBuilder {
         : this.#table.selectColumns(this.#projection);
     }
 
-    const evaluators = this.#predicates.map((predicate) => predicate.bind(this.#table));
-    const matches =
-      evaluators.length === 1
-        ? (evaluators[0] as (rowIndex: number) => boolean)
-        : (rowIndex: number): boolean => {
-            for (const evaluate of evaluators) {
-              if (!evaluate(rowIndex)) {
-                return false;
-              }
-            }
+    let matches: (rowIndex: number) => boolean;
 
-            return true;
-          };
+    if (this.#predicates.length === 1) {
+      const predicate = this.#predicates[0];
+
+      if (predicate === undefined) {
+        throw new SchemaError('Query predicate is missing.');
+      }
+
+      matches = predicate.bind(this.#table);
+    } else {
+      const evaluators = new Array<(rowIndex: number) => boolean>(this.#predicates.length);
+
+      for (let index = 0; index < this.#predicates.length; index += 1) {
+        const predicate = this.#predicates[index];
+
+        if (predicate === undefined) {
+          throw new SchemaError('Query predicate is missing.');
+        }
+
+        evaluators[index] = predicate.bind(this.#table);
+      }
+
+      matches = (rowIndex): boolean => {
+        for (const evaluate of evaluators) {
+          if (!evaluate(rowIndex)) {
+            return false;
+          }
+        }
+
+        return true;
+      };
+    }
+
     const rowCount = this.#table.rowCount;
 
     if (rowCount <= SMALL_TABLE_SELECTION_LIMIT) {
@@ -101,9 +122,9 @@ export class QueryBuilder {
       }
     }
 
-    const estimatedCount = Math.ceil(
-      (selectedCount / sampleSize) * rowCount * SELECTION_ESTIMATE_HEADROOM,
-    );
+    const estimatedDensity = selectedCount / sampleSize;
+
+    const estimatedCount = Math.ceil(estimatedDensity * rowCount * SELECTION_ESTIMATE_HEADROOM);
     const estimatedCapacity = Math.min(rowCount, Math.max(sampleSize, estimatedCount));
 
     if (estimatedCapacity > capacity) {

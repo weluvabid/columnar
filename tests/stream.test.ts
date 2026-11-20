@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { aggregateStream, col, count, mean, sum, table, variance } from '../src/index.js';
+import { aggregateStream, col, count, max, mean, min, sum, table, variance } from '../src/index.js';
 
 async function* chunks() {
   yield table([{ value: 1 }, { value: 2 }, { value: null }]);
@@ -35,6 +35,16 @@ describe('aggregateStream', () => {
     expect(result).toEqual({ total: 7, rows: 2 });
   });
 
+  it('treats null equality as an always-false streaming predicate', async () => {
+    const result = await aggregateStream(
+      chunks(),
+      { total: sum('value'), rows: count() },
+      { where: col('value').eq(null) },
+    );
+
+    expect(result).toEqual({ total: null, rows: 0 });
+  });
+
   it('preserves compensated sums across chunk boundaries', async () => {
     async function* cancellationChunks() {
       yield table({ value: new Float64Array([1e16]) });
@@ -45,6 +55,43 @@ describe('aggregateStream', () => {
     const result = await aggregateStream(cancellationChunks(), { total: sum('value') });
 
     expect(result['total']).toBe(1);
+  });
+
+  it('reuses aggregate plans across many chunks without leaking chunk state', async () => {
+    async function* manyChunks() {
+      for (let chunkIndex = 0; chunkIndex < 128; chunkIndex += 1) {
+        yield table({
+          value: new Float64Array([chunkIndex, chunkIndex + 1]),
+          weight: new Float64Array([1, 2]),
+        });
+      }
+    }
+
+    const result = await aggregateStream(
+      manyChunks(),
+      {
+        total: sum('value'),
+        average: mean('value'),
+        minimum: min('value'),
+        maximum: max('value'),
+        weightTotal: sum('weight'),
+        weightAverage: mean('weight'),
+        rows: count(),
+        present: count('value'),
+      },
+      { where: col('weight').gte(1) },
+    );
+
+    expect(result).toEqual({
+      total: 16_384,
+      average: 64,
+      minimum: 0,
+      maximum: 128,
+      weightTotal: 384,
+      weightAverage: 1.5,
+      rows: 256,
+      present: 256,
+    });
   });
 
   it('returns empty aggregate identities for an empty stream', async () => {

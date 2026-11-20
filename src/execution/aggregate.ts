@@ -52,9 +52,14 @@ interface AggregatePlan {
   readonly opcode: AggregateOpcode;
   readonly hasColumn: boolean;
   readonly state: AggregateState;
-  readonly values: NumericArray | undefined;
-  readonly validity: Uint32Array | undefined;
-  readonly column: Column | undefined;
+  values: NumericArray | undefined;
+  validity: Uint32Array | undefined;
+}
+
+interface NumericAggregateGroup {
+  values: NumericArray;
+  validity: Uint32Array | undefined;
+  readonly plans: AggregatePlan[];
 }
 
 export function sum(column: string): AggregateExpression {
@@ -136,7 +141,10 @@ export function aggregateTable(
   }
 
   const states = createStates(spec, table, entries);
-  const evaluators = predicates.map((predicate) => predicate.bind(table));
+  const numericPredicatePlan =
+    predicates.length === 0 ? undefined : compileNumericPredicatePlan(predicates, table);
+  const evaluators =
+    numericPredicatePlan === undefined ? predicates.map((predicate) => predicate.bind(table)) : [];
   const plans: AggregatePlan[] = [];
 
   for (const [name, expression] of entries) {
@@ -155,13 +163,64 @@ export function aggregateTable(
       state,
       values: numericColumn?.values,
       validity: getColumnValidity(column),
-      column: numericColumn === undefined ? column : undefined,
     });
+  }
+
+  if (numericPredicatePlan?.alwaysFalse === true) {
+    return finalizeStates(spec, states, entries);
+  }
+
+  const countPlans: AggregatePlan[] = [];
+  const groupsByValues = new Map<
+    NumericArray,
+    Map<Uint32Array | undefined, NumericAggregateGroup>
+  >();
+
+  for (const plan of plans) {
+    if (plan.opcode === AggregateOpcode.Count) {
+      countPlans.push(plan);
+      continue;
+    }
+
+    if (plan.values === undefined) {
+      continue;
+    }
+
+    let groupsByValidity = groupsByValues.get(plan.values);
+
+    if (groupsByValidity === undefined) {
+      groupsByValidity = new Map();
+      groupsByValues.set(plan.values, groupsByValidity);
+    }
+
+    let group = groupsByValidity.get(plan.validity);
+
+    if (group === undefined) {
+      group = { values: plan.values, validity: plan.validity, plans: [] };
+      groupsByValidity.set(plan.validity, group);
+    }
+
+    group.plans.push(plan);
+  }
+
+  const numericGroups: NumericAggregateGroup[] = [];
+
+  for (const groupsByValidity of groupsByValues.values()) {
+    for (const group of groupsByValidity.values()) {
+      numericGroups.push(group);
+    }
   }
 
   for (let rowIndex = 0; rowIndex < table.rowCount; rowIndex += 1) {
     if ((rowIndex & 4095) === 0 && isAborted(signal)) {
       throw new AbortExecutionError();
+    }
+
+    if (
+      numericPredicatePlan !== undefined &&
+      !matchesNumericPredicatePlan(numericPredicatePlan, rowIndex)
+    ) {
+      continue;
     }
 
     let matches = true;
@@ -179,38 +238,39 @@ export function aggregateTable(
       continue;
     }
 
-    for (let planIndex = 0; planIndex < plans.length; planIndex += 1) {
-      const plan = plans[planIndex];
+    const validityWord = rowIndex >>> 5;
+    const validityMask = 1 << (rowIndex & 31);
 
-      if (plan === undefined) {
-        continue;
-      }
+    for (let planIndex = 0; planIndex < countPlans.length; planIndex += 1) {
+      const plan = countPlans[planIndex];
 
-      if (plan.opcode === AggregateOpcode.Count) {
-        if (
-          !plan.hasColumn ||
+      if (
+        plan !== undefined &&
+        (!plan.hasColumn ||
           plan.validity === undefined ||
-          ((plan.validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0
-        ) {
-          plan.state.count += 1;
-        }
+          ((plan.validity[validityWord] as number) & validityMask) !== 0)
+      ) {
+        plan.state.count += 1;
+      }
+    }
 
+    for (let groupIndex = 0; groupIndex < numericGroups.length; groupIndex += 1) {
+      const group = numericGroups[groupIndex];
+
+      if (
+        group === undefined ||
+        (group.validity !== undefined &&
+          ((group.validity[validityWord] as number) & validityMask) === 0)
+      ) {
         continue;
       }
 
-      if (plan.values !== undefined) {
-        if (
-          plan.validity !== undefined &&
-          ((plan.validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
-        ) {
-          continue;
-        }
+      const value = group.values[rowIndex] as number;
 
-        updateState(plan.state, plan.opcode, plan.values[rowIndex] as number);
-      } else if (plan.column !== undefined) {
-        const value = plan.column.getUnchecked(rowIndex);
+      for (let planIndex = 0; planIndex < group.plans.length; planIndex += 1) {
+        const plan = group.plans[planIndex];
 
-        if (typeof value === 'number') {
+        if (plan !== undefined) {
           updateState(plan.state, plan.opcode, value);
         }
       }
@@ -231,6 +291,11 @@ export async function aggregateStream(
 
   const states = new Map<string, AggregateState>();
   const expressions = Object.entries(spec);
+  const chunkPlans: AggregatePlan[] = [];
+  const countPlans: AggregatePlan[] = [];
+  const numericGroups: NumericAggregateGroup[] = [];
+  const numericGroupsByColumn = new Map<string, NumericAggregateGroup>();
+  let groupsInitialized = false;
   let initialized = false;
 
   for (const [, expression] of expressions) {
@@ -257,9 +322,9 @@ export async function aggregateStream(
       options.where === undefined || predicatePlan !== undefined
         ? undefined
         : options.where.bind(chunk);
-    const chunkPlans: AggregatePlan[] = [];
 
-    for (const [name, expression] of expressions) {
+    for (let planIndex = 0; planIndex < expressions.length; planIndex += 1) {
+      const [name, expression] = expressions[planIndex] as [string, AggregateExpression];
       const state = states.get(name);
 
       if (state === undefined) {
@@ -273,15 +338,63 @@ export async function aggregateStream(
       }
 
       const numericColumn = column instanceof NumericColumn ? column : undefined;
+      const existingPlan = chunkPlans[planIndex];
 
-      chunkPlans.push({
-        opcode: getAggregateOpcode(expression.kind),
-        hasColumn: expression.column !== undefined,
-        state,
-        values: numericColumn?.values,
-        validity: getColumnValidity(column),
-        column: numericColumn === undefined ? column : undefined,
-      });
+      if (existingPlan === undefined) {
+        chunkPlans.push({
+          opcode: getAggregateOpcode(expression.kind),
+          hasColumn: expression.column !== undefined,
+          state,
+          values: numericColumn?.values,
+          validity: getColumnValidity(column),
+        });
+      } else {
+        existingPlan.values = numericColumn?.values;
+        existingPlan.validity = getColumnValidity(column);
+      }
+    }
+
+    if (!groupsInitialized) {
+      for (let planIndex = 0; planIndex < expressions.length; planIndex += 1) {
+        const plan = chunkPlans[planIndex];
+        const expression = expressions[planIndex]?.[1];
+
+        if (plan === undefined || expression === undefined) {
+          continue;
+        }
+
+        if (plan.opcode === AggregateOpcode.Count) {
+          countPlans.push(plan);
+          continue;
+        }
+
+        if (expression.column === undefined || plan.values === undefined) {
+          throw new SchemaError(`Aggregate '${expression.kind}' requires a numeric column.`);
+        }
+
+        let group = numericGroupsByColumn.get(expression.column);
+
+        if (group === undefined) {
+          group = { values: plan.values, validity: plan.validity, plans: [] };
+          numericGroupsByColumn.set(expression.column, group);
+          numericGroups.push(group);
+        }
+
+        group.plans.push(plan);
+      }
+
+      groupsInitialized = true;
+    } else {
+      for (const group of numericGroups) {
+        const firstPlan = group.plans[0];
+
+        if (firstPlan?.values === undefined) {
+          throw new SchemaError('Streaming aggregate column changed to a non-numeric type.');
+        }
+
+        group.values = firstPlan.values;
+        group.validity = firstPlan.validity;
+      }
     }
 
     for (let rowIndex = 0; rowIndex < chunk.rowCount; rowIndex += 1) {
@@ -297,38 +410,39 @@ export async function aggregateStream(
         continue;
       }
 
-      for (let planIndex = 0; planIndex < chunkPlans.length; planIndex += 1) {
-        const plan = chunkPlans[planIndex];
+      const validityWord = rowIndex >>> 5;
+      const validityMask = 1 << (rowIndex & 31);
 
-        if (plan === undefined) {
-          continue;
-        }
+      for (let planIndex = 0; planIndex < countPlans.length; planIndex += 1) {
+        const plan = countPlans[planIndex];
 
-        if (plan.opcode === AggregateOpcode.Count) {
-          if (
-            !plan.hasColumn ||
+        if (
+          plan !== undefined &&
+          (!plan.hasColumn ||
             plan.validity === undefined ||
-            ((plan.validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0
-          ) {
-            plan.state.count += 1;
-          }
+            ((plan.validity[validityWord] as number) & validityMask) !== 0)
+        ) {
+          plan.state.count += 1;
+        }
+      }
 
+      for (let groupIndex = 0; groupIndex < numericGroups.length; groupIndex += 1) {
+        const group = numericGroups[groupIndex];
+
+        if (
+          group === undefined ||
+          (group.validity !== undefined &&
+            ((group.validity[validityWord] as number) & validityMask) === 0)
+        ) {
           continue;
         }
 
-        if (plan.values !== undefined) {
-          if (
-            plan.validity !== undefined &&
-            ((plan.validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
-          ) {
-            continue;
-          }
+        const value = group.values[rowIndex] as number;
 
-          updateState(plan.state, plan.opcode, plan.values[rowIndex] as number);
-        } else if (plan.column !== undefined) {
-          const value = plan.column.getUnchecked(rowIndex);
+        for (let planIndex = 0; planIndex < group.plans.length; planIndex += 1) {
+          const plan = group.plans[planIndex];
 
-          if (typeof value === 'number') {
+          if (plan !== undefined) {
             updateState(plan.state, plan.opcode, value);
           }
         }
@@ -764,6 +878,10 @@ function aggregateSumGreaterThan(
 }
 
 function matchesNumericPredicatePlan(plan: NumericPredicatePlan, rowIndex: number): boolean {
+  if (plan.alwaysFalse) {
+    return false;
+  }
+
   const { values, validity, operators, operands } = plan;
   const predicateCount = operators.length;
 

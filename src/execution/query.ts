@@ -4,6 +4,10 @@ import { SchemaError } from '../core/errors.js';
 import type { Predicate } from '../expressions/predicate.js';
 import type { Table } from '../table/table.js';
 
+const SMALL_TABLE_SELECTION_LIMIT = 4_096;
+const SELECTION_SAMPLE_SIZE = 1_024;
+const SELECTION_ESTIMATE_HEADROOM = 1.125;
+
 export class QueryBuilder {
   readonly #table: Table;
   readonly #predicates: Predicate[] = [];
@@ -55,33 +59,73 @@ export class QueryBuilder {
       return source;
     }
 
-    const singleEvaluator =
-      this.#predicates.length === 1 ? this.#predicates[0]?.bind(this.#table) : undefined;
-    const evaluators =
-      this.#predicates.length > 1
-        ? this.#predicates.map((predicate) => predicate.bind(this.#table))
-        : undefined;
-    const indices = new Uint32Array(this.#table.rowCount);
+    const evaluators = this.#predicates.map((predicate) => predicate.bind(this.#table));
+    const matches =
+      evaluators.length === 1
+        ? (evaluators[0] as (rowIndex: number) => boolean)
+        : (rowIndex: number): boolean => {
+            for (const evaluate of evaluators) {
+              if (!evaluate(rowIndex)) {
+                return false;
+              }
+            }
+
+            return true;
+          };
+    const rowCount = this.#table.rowCount;
+
+    if (rowCount <= SMALL_TABLE_SELECTION_LIMIT) {
+      const indices = new Uint32Array(rowCount);
+      let selectedCount = 0;
+
+      for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+        if (!matches(rowIndex)) {
+          continue;
+        }
+
+        indices[selectedCount] = rowIndex;
+        selectedCount += 1;
+      }
+
+      return source.take(indices.subarray(0, selectedCount));
+    }
+
+    const sampleSize = SELECTION_SAMPLE_SIZE;
+    let capacity = sampleSize;
+    let indices = new Uint32Array(capacity);
     let selectedCount = 0;
 
-    for (let rowIndex = 0; rowIndex < this.#table.rowCount; rowIndex += 1) {
-      if (singleEvaluator !== undefined) {
-        if (!singleEvaluator(rowIndex)) {
-          continue;
-        }
-      } else if (evaluators !== undefined) {
-        let matches = true;
+    for (let rowIndex = 0; rowIndex < sampleSize; rowIndex += 1) {
+      if (matches(rowIndex)) {
+        indices[selectedCount] = rowIndex;
+        selectedCount += 1;
+      }
+    }
 
-        for (const evaluate of evaluators) {
-          if (!evaluate(rowIndex)) {
-            matches = false;
-            break;
-          }
-        }
+    const estimatedCount = Math.ceil(
+      (selectedCount / sampleSize) * rowCount * SELECTION_ESTIMATE_HEADROOM,
+    );
+    const estimatedCapacity = Math.min(rowCount, Math.max(sampleSize, estimatedCount));
 
-        if (!matches) {
-          continue;
-        }
+    if (estimatedCapacity > capacity) {
+      const expanded = new Uint32Array(estimatedCapacity);
+
+      expanded.set(indices.subarray(0, selectedCount));
+      indices = expanded;
+      capacity = estimatedCapacity;
+    }
+
+    for (let rowIndex = sampleSize; rowIndex < rowCount; rowIndex += 1) {
+      if (!matches(rowIndex)) {
+        continue;
+      }
+
+      if (selectedCount === capacity) {
+        capacity = Math.min(rowCount, capacity * 2);
+        const expanded = new Uint32Array(capacity);
+
+        expanded.set(indices);
+        indices = expanded;
       }
 
       indices[selectedCount] = rowIndex;

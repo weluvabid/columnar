@@ -19,6 +19,36 @@ describe('query execution', () => {
     expect(result.toRows()).toEqual([{ speed: 120, mode: 'sport' }]);
   });
 
+  it('grows sparse selection buffers when later rows are denser than the sample', () => {
+    const values = new Float64Array(10_000);
+
+    values.fill(1, 1_024);
+
+    const result = table({ value: values }).query().filter(col('value').eq(1)).execute();
+
+    const selectedRows = result.toRows();
+
+    expect(result.rowCount).toBe(8_976);
+    expect(selectedRows[0]).toEqual({ value: 1 });
+    expect(selectedRows[8_975]).toEqual({ value: 1 });
+  });
+
+  it('uses sampled selectivity to size sparse selection buffers', () => {
+    const values = new Float64Array(10_000);
+
+    for (let index = 0; index < values.length; index += 100) {
+      values[index] = 1;
+    }
+
+    const result = table({ value: values }).query().filter(col('value').eq(1)).execute();
+
+    const selectedRows = result.toRows();
+
+    expect(result.rowCount).toBe(100);
+    expect(selectedRows[0]).toEqual({ value: 1 });
+    expect(selectedRows[99]).toEqual({ value: 1 });
+  });
+
   it('composes OR, NOT, equality and null predicates', () => {
     const result = source
       .query()

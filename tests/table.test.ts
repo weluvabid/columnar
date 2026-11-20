@@ -29,6 +29,53 @@ describe('Table', () => {
     ]);
   });
 
+  it('constructs inferred columns directly while preserving missing and null values', () => {
+    const result = Table.fromRows([
+      { speed: 120, mode: 'sport', active: true },
+      { speed: undefined, mode: 'eco', active: false },
+      { speed: 80, mode: undefined, active: null },
+      { speed: null, mode: 'sport', active: true },
+    ]);
+
+    expect(result.toRows()).toEqual([
+      { speed: 120, mode: 'sport', active: true },
+      { speed: null, mode: 'eco', active: false },
+      { speed: 80, mode: null, active: null },
+      { speed: null, mode: 'sport', active: true },
+    ]);
+  });
+
+  it('infers an all-null column as numeric', () => {
+    const result = Table.fromRows([{ value: null }, { value: undefined }]);
+
+    expect(result.column('value')).toBeInstanceOf(NumericColumn);
+    expect(result.toRows()).toEqual([{ value: null }, { value: null }]);
+  });
+
+  it('validates row schemas and inferred column types', () => {
+    expect(() => Table.fromRows([{ value: 1 }, { value: 2, extra: true }])).toThrow(SchemaError);
+    expect(() => Table.fromRows([{ value: 1 }, { value: 'two' }])).toThrow(SchemaError);
+  });
+
+  it('reads accessor-backed row values once during ingestion', () => {
+    let reads = 0;
+    const row: Record<string, number> = {};
+
+    Object.defineProperty(row, 'value', {
+      enumerable: true,
+      get() {
+        reads += 1;
+
+        return 42;
+      },
+    });
+
+    const result = Table.fromRows([row]);
+
+    expect(reads).toBe(1);
+    expect(result.toRows()).toEqual([{ value: 42 }]);
+  });
+
   it('retains typed-array input without copying', () => {
     const values = new Float32Array([1, 2, 3]);
     const result = Table.fromColumns({ value: values });

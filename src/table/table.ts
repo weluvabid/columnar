@@ -1,7 +1,24 @@
-import { createColumn, type Column } from '../column/column.js';
+import {
+  BooleanColumn,
+  createColumn,
+  DictionaryColumn,
+  NumericColumn,
+  type Column,
+} from '../column/column.js';
 import { SchemaError } from '../core/errors.js';
-import type { ColumnInput, Row, Scalar } from '../core/types.js';
+import type { ColumnInput, NumericArray, Row } from '../core/types.js';
 import { QueryBuilder } from '../execution/query.js';
+import { setValidPrefix } from '../memory/validity.js';
+
+type ColumnValueKind = 'number' | 'string' | 'boolean';
+
+interface ColumnBuilder {
+  kind: ColumnValueKind | undefined;
+  values: NumericArray | undefined;
+  validity: Uint32Array | undefined;
+  dictionary: string[] | undefined;
+  dictionaryMap: Map<string, number> | undefined;
+}
 
 export class Table {
   readonly rowCount: number;
@@ -60,11 +77,6 @@ export class Table {
     }
 
     const nameSet = new Set(names);
-    const columns = Object.create(null) as Record<string, (Scalar | undefined)[]>;
-
-    for (const name of names) {
-      columns[name] = new Array<Scalar | undefined>(rows.length);
-    }
 
     for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
       const row = rows[rowIndex];
@@ -78,19 +90,117 @@ export class Table {
           throw new SchemaError(`Row ${rowIndex} contains unexpected column '${key}'.`);
         }
       }
+    }
 
-      for (const name of names) {
-        const column = columns[name];
+    const builders: ColumnBuilder[] = new Array(names.length);
 
-        if (column === undefined) {
-          throw new SchemaError(`Unable to construct column '${name}'.`);
+    for (let columnIndex = 0; columnIndex < names.length; columnIndex += 1) {
+      builders[columnIndex] = {
+        kind: undefined,
+        values: undefined,
+        validity: undefined,
+        dictionary: undefined,
+        dictionaryMap: undefined,
+      };
+    }
+
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      const row = rows[rowIndex] as Row;
+
+      for (let columnIndex = 0; columnIndex < names.length; columnIndex += 1) {
+        const name = names[columnIndex] as string;
+        const builder = builders[columnIndex] as ColumnBuilder;
+        const value = Object.hasOwn(row, name) ? row[name] : undefined;
+
+        if (value === null || value === undefined) {
+          if (builder.validity === undefined) {
+            const validity = new Uint32Array(Math.ceil(rows.length / 32));
+
+            if (builder.kind !== undefined) {
+              setValidPrefix(validity, rowIndex);
+            }
+
+            builder.validity = validity;
+          }
+
+          continue;
         }
 
-        column[rowIndex] = Object.hasOwn(row, name) ? row[name] : undefined;
+        const valueType = typeof value;
+
+        if (valueType !== 'number' && valueType !== 'string' && valueType !== 'boolean') {
+          throw new SchemaError(`Unsupported column value: ${String(value)}.`);
+        }
+
+        if (builder.kind === undefined) {
+          builder.kind = valueType;
+
+          if (valueType === 'string') {
+            builder.values = new Uint32Array(rows.length);
+            builder.dictionary = [];
+            builder.dictionaryMap = new Map<string, number>();
+          } else if (valueType === 'boolean') {
+            builder.values = new Uint8Array(rows.length);
+          } else {
+            builder.values = new Float64Array(rows.length);
+          }
+        } else if (builder.kind !== valueType) {
+          throw new SchemaError(
+            `Mixed column types are not supported (${builder.kind} and ${valueType}).`,
+          );
+        }
+
+        if (builder.kind === 'string') {
+          const dictionary = builder.dictionary as string[];
+          const dictionaryMap = builder.dictionaryMap as Map<string, number>;
+          const stringValue = value as string;
+          let dictionaryIndex = dictionaryMap.get(stringValue);
+
+          if (dictionaryIndex === undefined) {
+            dictionaryIndex = dictionary.length;
+            dictionaryMap.set(stringValue, dictionaryIndex);
+            dictionary.push(stringValue);
+          }
+
+          (builder.values as Uint32Array)[rowIndex] = dictionaryIndex;
+        } else if (builder.kind === 'boolean') {
+          (builder.values as Uint8Array)[rowIndex] = value === true ? 1 : 0;
+        } else {
+          (builder.values as Float64Array)[rowIndex] = value as number;
+        }
+
+        if (builder.validity !== undefined) {
+          builder.validity[rowIndex >>> 5] =
+            (builder.validity[rowIndex >>> 5] as number) | (1 << (rowIndex & 31));
+        }
       }
     }
 
-    return Table.fromColumns(columns);
+    const columns = new Map<string, Column>();
+
+    for (let columnIndex = 0; columnIndex < names.length; columnIndex += 1) {
+      const name = names[columnIndex] as string;
+      const builder = builders[columnIndex] as ColumnBuilder;
+      const kind = builder.kind ?? 'number';
+      const values = builder.values ?? new Float64Array(rows.length);
+
+      if (kind === 'string') {
+        columns.set(
+          name,
+          new DictionaryColumn(
+            values as Uint32Array,
+            builder.dictionary as string[],
+            builder.validity,
+          ),
+        );
+      } else if (kind === 'boolean') {
+        columns.set(name, new BooleanColumn(values as Uint8Array, builder.validity));
+      } else {
+        columns.set(name, new NumericColumn(values, builder.validity));
+      }
+    }
+
+    return new Table(columns, rows.length);
   }
 
   column(name: string): Column {

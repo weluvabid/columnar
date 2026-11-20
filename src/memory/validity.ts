@@ -1,32 +1,12 @@
-const BITS_PER_WORD = 32;
+export function setValidPrefix(bitmap: Uint32Array, length: number): void {
+  const fullWords = length >>> 5;
+  const remainingBits = length & 31;
 
-export function createValidityBitmap(values: readonly unknown[]): Uint32Array | undefined {
-  let hasNulls = false;
+  bitmap.fill(0xffff_ffff, 0, fullWords);
 
-  for (let index = 0; index < values.length; index += 1) {
-    const value = values[index];
-
-    if (value === null || value === undefined) {
-      hasNulls = true;
-      break;
-    }
+  if (remainingBits !== 0) {
+    bitmap[fullWords] = (1 << remainingBits) - 1;
   }
-
-  if (!hasNulls) {
-    return undefined;
-  }
-
-  const bitmap = new Uint32Array(Math.ceil(values.length / BITS_PER_WORD));
-
-  for (let index = 0; index < values.length; index += 1) {
-    const value = values[index];
-
-    if (value !== null && value !== undefined) {
-      bitmap[index >>> 5] = (bitmap[index >>> 5] ?? 0) | (1 << (index & 31));
-    }
-  }
-
-  return bitmap;
 }
 
 export function isValid(bitmap: Uint32Array | undefined, index: number): boolean {

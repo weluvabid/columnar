@@ -60,6 +60,15 @@ describe('Table', () => {
     expect(result.toRows().map((row) => row['__proto__'])).toEqual(['first', 'second']);
   });
 
+  it('avoids allocating a validity bitmap when take selects only valid rows', () => {
+    const source = table({ value: [1, null, 3] });
+    const selected = source.take(new Uint32Array([0, 2]));
+    const selectedColumn = selected.column('value') as NumericColumn;
+
+    expect(selectedColumn.validity).toBeUndefined();
+    expect(selected.toRows()).toEqual([{ value: 1 }, { value: 3 }]);
+  });
+
   it('rejects columns with different lengths', () => {
     expect(() => Table.fromColumns({ a: [1, 2], b: [1] })).toThrow(SchemaError);
   });

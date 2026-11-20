@@ -21,9 +21,9 @@ Queries are synchronous and read the input buffers during execution. Callers mus
 ## Allocation boundaries
 
 - `Table.fromColumns` retains typed-array buffers.
-- `Table.fromRows` allocates typed column buffers and converts row values once.
+- `Table.fromRows` allocates typed column buffers and converts row values once. Column type inference and validity detection share a pass.
 - `select` creates a new table/schema view and reuses selected column objects.
-- `filter().execute()` allocates a row-index selection buffer and compact output buffers.
+- `filter().execute()` allocates a row-index selection buffer and compact output buffers. `take()` allocates a validity bitmap only if the selected output actually contains nulls.
 - `aggregate().execute()` allocates aggregate state and result fields, not intermediate tables.
 - `aggregateStream` retains aggregate state and the current producer-supplied chunk.
 

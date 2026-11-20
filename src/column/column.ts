@@ -1,6 +1,6 @@
 import { SchemaError } from '../core/errors.js';
 import type { ColumnInput, NumericArray, Scalar } from '../core/types.js';
-import { countNulls, createValidityBitmap, isValid } from '../memory/validity.js';
+import { countNulls, isValid, setValidPrefix } from '../memory/validity.js';
 
 export type ColumnKind =
   | 'int8'
@@ -70,23 +70,34 @@ export class NumericColumn extends Column {
   take(indices: Uint32Array): NumericColumn {
     const Constructor = this.values.constructor as new (length: number) => NumericArray;
     const values = new Constructor(indices.length);
-    const validity = new Uint32Array(Math.ceil(indices.length / 32));
-    let hasNulls = false;
+    let validity: Uint32Array | undefined;
 
     for (let target = 0; target < indices.length; target += 1) {
-      const source = indices[target] ?? 0;
-      const value = this.get(source);
+      const source = indices[target] as number;
 
-      if (value === null) {
-        hasNulls = true;
+      this.assertIndex(source);
+
+      if (
+        this.validity !== undefined &&
+        ((this.validity[source >>> 5] as number) & (1 << (source & 31))) === 0
+      ) {
+        if (validity === undefined) {
+          validity = new Uint32Array(Math.ceil(indices.length / 32));
+
+          setValidPrefix(validity, target);
+        }
+
         continue;
       }
 
-      values[target] = value;
-      validity[target >>> 5] = (validity[target >>> 5] ?? 0) | (1 << (target & 31));
+      values[target] = this.values[source] as number;
+
+      if (validity !== undefined) {
+        (validity[target >>> 5] as number) |= 1 << (target & 31);
+      }
     }
 
-    return new NumericColumn(values, hasNulls ? validity : undefined);
+    return new NumericColumn(values, validity);
   }
 
   getNullCount(): number {
@@ -128,22 +139,34 @@ export class BooleanColumn extends Column {
 
   take(indices: Uint32Array): BooleanColumn {
     const values = new Uint8Array(indices.length);
-    const validity = new Uint32Array(Math.ceil(indices.length / 32));
-    let hasNulls = false;
+    let validity: Uint32Array | undefined;
 
     for (let target = 0; target < indices.length; target += 1) {
-      const value = this.get(indices[target] ?? 0);
+      const source = indices[target] as number;
 
-      if (value === null) {
-        hasNulls = true;
+      this.assertIndex(source);
+
+      if (
+        this.validity !== undefined &&
+        ((this.validity[source >>> 5] as number) & (1 << (source & 31))) === 0
+      ) {
+        if (validity === undefined) {
+          validity = new Uint32Array(Math.ceil(indices.length / 32));
+
+          setValidPrefix(validity, target);
+        }
+
         continue;
       }
 
-      values[target] = value ? 1 : 0;
-      validity[target >>> 5] = (validity[target >>> 5] ?? 0) | (1 << (target & 31));
+      values[target] = this.values[source] as number;
+
+      if (validity !== undefined) {
+        (validity[target >>> 5] as number) |= 1 << (target & 31);
+      }
     }
 
-    return new BooleanColumn(values, hasNulls ? validity : undefined);
+    return new BooleanColumn(values, validity);
   }
 
   getNullCount(): number {
@@ -194,24 +217,34 @@ export class DictionaryColumn extends Column {
 
   take(indices: Uint32Array): DictionaryColumn {
     const values = new Uint32Array(indices.length);
-    const validity = new Uint32Array(Math.ceil(indices.length / 32));
-    let hasNulls = false;
+    let validity: Uint32Array | undefined;
 
     for (let target = 0; target < indices.length; target += 1) {
-      const source = indices[target] ?? 0;
+      const source = indices[target] as number;
 
       this.assertIndex(source);
 
-      if (!isValid(this.validity, source)) {
-        hasNulls = true;
+      if (
+        this.validity !== undefined &&
+        ((this.validity[source >>> 5] as number) & (1 << (source & 31))) === 0
+      ) {
+        if (validity === undefined) {
+          validity = new Uint32Array(Math.ceil(indices.length / 32));
+
+          setValidPrefix(validity, target);
+        }
+
         continue;
       }
 
-      values[target] = this.indices[source] ?? 0;
-      validity[target >>> 5] = (validity[target >>> 5] ?? 0) | (1 << (target & 31));
+      values[target] = this.indices[source] as number;
+
+      if (validity !== undefined) {
+        (validity[target >>> 5] as number) |= 1 << (target & 31);
+      }
     }
 
-    return new DictionaryColumn(values, this.dictionary, hasNulls ? validity : undefined);
+    return new DictionaryColumn(values, this.dictionary, validity);
   }
 
   getNullCount(): number {
@@ -247,10 +280,23 @@ export function createColumn(input: ColumnInput): Column {
 
   const values = input as readonly (number | string | boolean | null | undefined)[];
   let kind: 'number' | 'string' | 'boolean' | undefined;
+  let validity: Uint32Array | undefined;
 
-  for (const value of values) {
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+
     if (value === null || value === undefined) {
+      if (validity === undefined) {
+        validity = new Uint32Array(Math.ceil(values.length / 32));
+
+        setValidPrefix(validity, index);
+      }
+
       continue;
+    }
+
+    if (validity !== undefined) {
+      (validity[index >>> 5] as number) |= 1 << (index & 31);
     }
 
     const nextKind = typeof value;
@@ -265,8 +311,6 @@ export function createColumn(input: ColumnInput): Column {
 
     kind = nextKind;
   }
-
-  const validity = createValidityBitmap(values);
 
   if (kind === 'string') {
     const dictionary: string[] = [];

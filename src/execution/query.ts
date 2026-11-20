@@ -55,24 +55,37 @@ export class QueryBuilder {
       return source;
     }
 
-    const evaluators = this.#predicates.map((predicate) => predicate.bind(this.#table));
+    const singleEvaluator =
+      this.#predicates.length === 1 ? this.#predicates[0]?.bind(this.#table) : undefined;
+    const evaluators =
+      this.#predicates.length > 1
+        ? this.#predicates.map((predicate) => predicate.bind(this.#table))
+        : undefined;
     const indices = new Uint32Array(this.#table.rowCount);
     let selectedCount = 0;
 
     for (let rowIndex = 0; rowIndex < this.#table.rowCount; rowIndex += 1) {
-      let matches = true;
+      if (singleEvaluator !== undefined) {
+        if (!singleEvaluator(rowIndex)) {
+          continue;
+        }
+      } else if (evaluators !== undefined) {
+        let matches = true;
 
-      for (const evaluate of evaluators) {
-        if (!evaluate(rowIndex)) {
-          matches = false;
-          break;
+        for (const evaluate of evaluators) {
+          if (!evaluate(rowIndex)) {
+            matches = false;
+            break;
+          }
+        }
+
+        if (!matches) {
+          continue;
         }
       }
 
-      if (matches) {
-        indices[selectedCount] = rowIndex;
-        selectedCount += 1;
-      }
+      indices[selectedCount] = rowIndex;
+      selectedCount += 1;
     }
 
     return source.take(indices.subarray(0, selectedCount));

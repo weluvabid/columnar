@@ -1,6 +1,5 @@
-import type { Scalar } from '../core/types.js';
-import { NumericColumn } from '../column/column.js';
-import { isValid } from '../memory/validity.js';
+import type { NumericArray, Scalar } from '../core/types.js';
+import { BooleanColumn, DictionaryColumn, NumericColumn } from '../column/column.js';
 import { SchemaError } from '../core/errors.js';
 import type { Table } from '../table/table.js';
 
@@ -33,9 +32,7 @@ export class Predicate {
   }
 
   bind(table: Table): (rowIndex: number) => boolean {
-    const evaluator = compile(this.node, table);
-
-    return (rowIndex) => evaluator(rowIndex);
+    return compile(this.node, table);
   }
 
   matches(table: Table, rowIndex: number): boolean {
@@ -93,6 +90,132 @@ export function col(name: string): ColumnExpression {
 
 type BoundPredicate = (rowIndex: number) => boolean;
 
+export const NumericPredicateOperator = {
+  Equal: 0,
+  NotEqual: 1,
+  GreaterThan: 2,
+  GreaterThanOrEqual: 3,
+  LessThan: 4,
+  LessThanOrEqual: 5,
+  IsNull: 6,
+  IsNotNull: 7,
+} as const;
+
+export interface NumericPredicatePlan {
+  readonly values: readonly NumericArray[];
+  readonly validity: readonly (Uint32Array | undefined)[];
+  readonly operators: Uint8Array;
+  readonly operands: Float64Array;
+  readonly alwaysFalse: boolean;
+}
+
+const EMPTY_NUMERIC_PREDICATE_PLAN: NumericPredicatePlan = {
+  values: [],
+  validity: [],
+  operators: new Uint8Array(0),
+  operands: new Float64Array(0),
+  alwaysFalse: false,
+};
+
+export function compileNumericPredicatePlan(
+  predicates: readonly Predicate[],
+  table: Table,
+): NumericPredicatePlan | undefined {
+  if (predicates.length === 0) {
+    return EMPTY_NUMERIC_PREDICATE_PLAN;
+  }
+
+  const values: NumericArray[] = [];
+  const validity: (Uint32Array | undefined)[] = [];
+  const operators: number[] = [];
+  const operands: number[] = [];
+  let alwaysFalse = false;
+
+  const append = (node: PredicateNode): boolean => {
+    if (node.type === 'and') {
+      return append(node.left) && append(node.right);
+    }
+
+    if (node.type === 'comparison') {
+      const column = table.column(node.column);
+
+      if (!(column instanceof NumericColumn)) {
+        return false;
+      }
+
+      if (node.value === null) {
+        alwaysFalse = true;
+
+        return true;
+      }
+
+      if (typeof node.value !== 'number') {
+        return false;
+      }
+
+      values.push(column.values);
+      validity.push(column.validity);
+      operands.push(node.value);
+
+      switch (node.operator) {
+        case 'eq':
+          operators.push(NumericPredicateOperator.Equal);
+          break;
+        case 'ne':
+          operators.push(NumericPredicateOperator.NotEqual);
+          break;
+        case 'gt':
+          operators.push(NumericPredicateOperator.GreaterThan);
+          break;
+        case 'gte':
+          operators.push(NumericPredicateOperator.GreaterThanOrEqual);
+          break;
+        case 'lt':
+          operators.push(NumericPredicateOperator.LessThan);
+          break;
+        case 'lte':
+          operators.push(NumericPredicateOperator.LessThanOrEqual);
+          break;
+      }
+
+      return true;
+    }
+
+    if (node.type === 'null') {
+      const column = table.column(node.column);
+
+      if (!(column instanceof NumericColumn)) {
+        return false;
+      }
+
+      values.push(column.values);
+      validity.push(column.validity);
+      operands.push(0);
+      operators.push(
+        node.negate ? NumericPredicateOperator.IsNotNull : NumericPredicateOperator.IsNull,
+      );
+
+      return true;
+    }
+
+    return false;
+  };
+
+  for (const predicate of predicates) {
+    if (!append(predicate.node)) {
+      return undefined;
+    }
+  }
+
+  return {
+    values,
+    validity,
+    operators: Uint8Array.from(operators),
+    operands: Float64Array.from(operands),
+    alwaysFalse,
+  };
+}
+
 function compile(node: PredicateNode, table: Table): BoundPredicate {
   switch (node.type) {
     case 'comparison': {
@@ -103,6 +226,60 @@ function compile(node: PredicateNode, table: Table): BoundPredicate {
         return () => false;
       }
 
+      if (column instanceof DictionaryColumn && typeof right === 'string') {
+        const dictionaryIndex = column.dictionary.indexOf(right);
+        const indices = column.indices;
+        const validity = column.validity;
+
+        if (node.operator === 'eq') {
+          if (dictionaryIndex === -1) {
+            return () => false;
+          }
+
+          return (rowIndex) =>
+            (validity === undefined ||
+              ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0) &&
+            indices[rowIndex] === dictionaryIndex;
+        }
+
+        if (node.operator === 'ne') {
+          if (dictionaryIndex === -1) {
+            return (rowIndex) =>
+              validity === undefined ||
+              ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
+          }
+
+          return (rowIndex) =>
+            (validity === undefined ||
+              ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0) &&
+            indices[rowIndex] !== dictionaryIndex;
+        }
+
+        return () => false;
+      }
+
+      if (column instanceof BooleanColumn && typeof right === 'boolean') {
+        const values = column.values;
+        const validity = column.validity;
+        const expected = right ? 1 : 0;
+
+        if (node.operator === 'eq') {
+          return (rowIndex) =>
+            (validity === undefined ||
+              ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0) &&
+            values[rowIndex] === expected;
+        }
+
+        if (node.operator === 'ne') {
+          return (rowIndex) =>
+            (validity === undefined ||
+              ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0) &&
+            values[rowIndex] !== expected;
+        }
+
+        return () => false;
+      }
+
       if (column instanceof NumericColumn && typeof right === 'number') {
         const values = column.values;
         const validity = column.validity;
@@ -110,39 +287,51 @@ function compile(node: PredicateNode, table: Table): BoundPredicate {
         switch (node.operator) {
           case 'eq':
             return (rowIndex) => {
-              const valid = validity === undefined || isValid(validity, rowIndex);
+              const valid =
+                validity === undefined ||
+                ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
 
               return valid && values[rowIndex] === right;
             };
           case 'ne':
             return (rowIndex) => {
-              const valid = validity === undefined || isValid(validity, rowIndex);
+              const valid =
+                validity === undefined ||
+                ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
 
               return valid && values[rowIndex] !== right;
             };
           case 'gt':
             return (rowIndex) => {
-              const valid = validity === undefined || isValid(validity, rowIndex);
+              const valid =
+                validity === undefined ||
+                ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
 
-              return valid && (values[rowIndex] ?? 0) > right;
+              return valid && (values[rowIndex] as number) > right;
             };
           case 'gte':
             return (rowIndex) => {
-              const valid = validity === undefined || isValid(validity, rowIndex);
+              const valid =
+                validity === undefined ||
+                ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
 
-              return valid && (values[rowIndex] ?? 0) >= right;
+              return valid && (values[rowIndex] as number) >= right;
             };
           case 'lt':
             return (rowIndex) => {
-              const valid = validity === undefined || isValid(validity, rowIndex);
+              const valid =
+                validity === undefined ||
+                ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
 
-              return valid && (values[rowIndex] ?? 0) < right;
+              return valid && (values[rowIndex] as number) < right;
             };
           case 'lte':
             return (rowIndex) => {
-              const valid = validity === undefined || isValid(validity, rowIndex);
+              const valid =
+                validity === undefined ||
+                ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
 
-              return valid && (values[rowIndex] ?? 0) <= right;
+              return valid && (values[rowIndex] as number) <= right;
             };
         }
       }
@@ -172,6 +361,21 @@ function compile(node: PredicateNode, table: Table): BoundPredicate {
     }
     case 'null': {
       const column = table.column(node.column);
+
+      if (
+        column instanceof NumericColumn ||
+        column instanceof BooleanColumn ||
+        column instanceof DictionaryColumn
+      ) {
+        const validity = column.validity;
+
+        if (validity === undefined) {
+          return () => node.negate;
+        }
+
+        return (rowIndex) =>
+          (((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0) !== node.negate;
+      }
 
       return (rowIndex) => (column.getUnchecked(rowIndex) === null) !== node.negate;
     }

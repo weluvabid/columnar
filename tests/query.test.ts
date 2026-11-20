@@ -63,6 +63,49 @@ describe('query execution', () => {
     });
   });
 
+  it('uses flattened numeric predicates with correct comparison and null semantics', () => {
+    const values = table({
+      first: [1, 2, 3, 4, null],
+      second: [10, 20, 30, 40, 50],
+    });
+
+    expect(
+      values
+        .query()
+        .filter(col('first').gt(1).and(col('first').lte(4)).and(col('second').ne(30)))
+        .aggregate({ total: sum('first') })
+        .execute(),
+    ).toEqual({ total: 6 });
+
+    expect(
+      values
+        .query()
+        .filter(col('first').isNull())
+        .aggregate({ total: sum('second') })
+        .execute(),
+    ).toEqual({ total: 50 });
+
+    expect(
+      values
+        .query()
+        .filter(col('first').isNotNull())
+        .aggregate({ total: sum('first') })
+        .execute(),
+    ).toEqual({ total: 10 });
+  });
+
+  it('preserves JavaScript comparison semantics for NaN predicates', () => {
+    const values = table({ value: [Number.NaN, 1, 3] });
+
+    expect(
+      values
+        .query()
+        .filter(col('value').gt(1))
+        .aggregate({ total: sum('value') })
+        .execute(),
+    ).toEqual({ total: 3 });
+  });
+
   it('preserves low-order terms during large-magnitude cancellation', () => {
     const values = new Float64Array([1e16, 1, -1e16]);
     const singleAggregate = table({ value: values })
@@ -100,6 +143,17 @@ describe('query execution', () => {
       .execute();
 
     expect(result).toEqual({ total: null, average: null, rows: 1, present: 0 });
+  });
+
+  it('compares dictionary values through encoded indices without changing null semantics', () => {
+    const modes = table({ mode: ['eco', null, 'sport'] });
+
+    expect(
+      modes.query().filter(col('mode').ne('missing')).aggregate({ rows: count() }).execute(),
+    ).toEqual({ rows: 2 });
+    expect(
+      modes.query().filter(col('mode').eq('missing')).aggregate({ rows: count() }).execute(),
+    ).toEqual({ rows: 0 });
   });
 
   it('supports dictionary and boolean columns in count', () => {

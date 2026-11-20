@@ -1,11 +1,30 @@
 import { AbortExecutionError, SchemaError } from '../core/errors.js';
-import type { NumericArray, Scalar } from '../core/types.js';
-import type { Predicate } from '../expressions/predicate.js';
-import { NumericColumn, type Column, type ColumnKind } from '../column/column.js';
-import { isValid } from '../memory/validity.js';
+import type { NumericArray } from '../core/types.js';
+import {
+  compileNumericPredicatePlan,
+  NumericPredicateOperator,
+  type NumericPredicatePlan,
+  type Predicate,
+} from '../expressions/predicate.js';
+import {
+  BooleanColumn,
+  DictionaryColumn,
+  NumericColumn,
+  type Column,
+  type ColumnKind,
+} from '../column/column.js';
 import type { Table } from '../table/table.js';
 
 export type AggregateKind = 'sum' | 'mean' | 'min' | 'max' | 'count' | 'variance';
+
+const enum AggregateOpcode {
+  Sum,
+  Mean,
+  Min,
+  Max,
+  Count,
+  Variance,
+}
 
 export interface AggregateExpression {
   readonly kind: AggregateKind;
@@ -30,7 +49,8 @@ interface AggregateState {
 }
 
 interface AggregatePlan {
-  readonly expression: AggregateExpression;
+  readonly opcode: AggregateOpcode;
+  readonly hasColumn: boolean;
   readonly state: AggregateState;
   readonly values: NumericArray | undefined;
   readonly validity: Uint32Array | undefined;
@@ -67,11 +87,59 @@ export function aggregateTable(
   predicates: readonly Predicate[] = [],
   options: AggregateOptions = {},
 ): Record<string, number | null> {
-  const states = createStates(spec, table);
+  const signal = options.signal;
+
+  if (signal?.aborted === true) {
+    throw new AbortExecutionError();
+  }
+
+  const entries = Object.entries(spec);
+
+  if (entries.length === 1) {
+    const entry = entries[0];
+
+    if (entry !== undefined) {
+      const [name, expression] = entry;
+
+      assertAggregateKind(expression.kind);
+
+      if (expression.column === undefined && expression.kind !== 'count') {
+        throw new SchemaError(`Aggregate '${expression.kind}' requires a column name.`);
+      }
+
+      const column = expression.column === undefined ? undefined : table.column(expression.column);
+
+      if (column !== undefined) {
+        validateAggregateColumn(expression, column.kind);
+      }
+
+      if (column instanceof NumericColumn) {
+        const predicatePlan = compileNumericPredicatePlan(predicates, table);
+
+        if (predicatePlan !== undefined) {
+          const state = aggregateSingleNumeric(
+            expression,
+            column.values,
+            column.validity,
+            table.rowCount,
+            predicatePlan,
+            signal,
+          );
+          const result: Record<string, number | null> = {};
+
+          setResult(result, name, finalizeSingle(expression, state));
+
+          return result;
+        }
+      }
+    }
+  }
+
+  const states = createStates(spec, table, entries);
   const evaluators = predicates.map((predicate) => predicate.bind(table));
   const plans: AggregatePlan[] = [];
 
-  for (const [name, expression] of Object.entries(spec)) {
+  for (const [name, expression] of entries) {
     const state = states.get(name);
 
     if (state === undefined) {
@@ -82,32 +150,17 @@ export function aggregateTable(
     const numericColumn = column instanceof NumericColumn ? column : undefined;
 
     plans.push({
-      expression,
+      opcode: getAggregateOpcode(expression.kind),
+      hasColumn: expression.column !== undefined,
       state,
       values: numericColumn?.values,
-      validity: numericColumn?.validity,
+      validity: getColumnValidity(column),
       column: numericColumn === undefined ? column : undefined,
     });
   }
 
-  const signal = options.signal;
-
-  if (signal?.aborted === true) {
-    throw new AbortExecutionError();
-  }
-
-  if (plans.length === 1 && evaluators.length <= 1) {
-    const plan = plans[0];
-
-    if (plan !== undefined && plan.values !== undefined) {
-      aggregateSingleNumeric(plan, table.rowCount, evaluators[0], signal);
-
-      return finalizeStates(spec, states);
-    }
-  }
-
   for (let rowIndex = 0; rowIndex < table.rowCount; rowIndex += 1) {
-    if (signal !== undefined && signal.aborted) {
+    if ((rowIndex & 4095) === 0 && isAborted(signal)) {
       throw new AbortExecutionError();
     }
 
@@ -133,34 +186,38 @@ export function aggregateTable(
         continue;
       }
 
-      let value: Scalar;
+      if (plan.opcode === AggregateOpcode.Count) {
+        if (
+          !plan.hasColumn ||
+          plan.validity === undefined ||
+          ((plan.validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0
+        ) {
+          plan.state.count += 1;
+        }
+
+        continue;
+      }
 
       if (plan.values !== undefined) {
-        if (plan.validity !== undefined && !isValid(plan.validity, rowIndex)) {
+        if (
+          plan.validity !== undefined &&
+          ((plan.validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
+        ) {
           continue;
         }
 
-        value = plan.values[rowIndex] ?? 0;
+        updateState(plan.state, plan.opcode, plan.values[rowIndex] as number);
       } else if (plan.column !== undefined) {
-        value = plan.column.getUnchecked(rowIndex);
-      } else {
-        value = 1;
-      }
+        const value = plan.column.getUnchecked(rowIndex);
 
-      if (value === null) {
-        continue;
+        if (typeof value === 'number') {
+          updateState(plan.state, plan.opcode, value);
+        }
       }
-
-      if (typeof value !== 'number') {
-        plan.state.count += 1;
-        continue;
-      }
-
-      updateState(plan.state, plan.expression, value);
     }
   }
 
-  return finalizeStates(spec, states);
+  return finalizeStates(spec, states, entries);
 }
 
 export async function aggregateStream(
@@ -190,11 +247,16 @@ export async function aggregateStream(
     }
 
     if (!initialized) {
-      createStates(spec, chunk, states);
+      createStates(spec, chunk, expressions, states);
       initialized = true;
     }
 
-    const evaluators = options.where?.bind(chunk);
+    const predicatePlan =
+      options.where === undefined ? undefined : compileNumericPredicatePlan([options.where], chunk);
+    const evaluator =
+      options.where === undefined || predicatePlan !== undefined
+        ? undefined
+        : options.where.bind(chunk);
     const chunkPlans: AggregatePlan[] = [];
 
     for (const [name, expression] of expressions) {
@@ -213,20 +275,25 @@ export async function aggregateStream(
       const numericColumn = column instanceof NumericColumn ? column : undefined;
 
       chunkPlans.push({
-        expression,
+        opcode: getAggregateOpcode(expression.kind),
+        hasColumn: expression.column !== undefined,
         state,
         values: numericColumn?.values,
-        validity: numericColumn?.validity,
+        validity: getColumnValidity(column),
         column: numericColumn === undefined ? column : undefined,
       });
     }
 
     for (let rowIndex = 0; rowIndex < chunk.rowCount; rowIndex += 1) {
-      if (isAborted(options.signal)) {
+      if ((rowIndex & 4095) === 0 && isAborted(options.signal)) {
         throw new AbortExecutionError();
       }
 
-      if (evaluators !== undefined && !evaluators(rowIndex)) {
+      if (predicatePlan !== undefined && !matchesNumericPredicatePlan(predicatePlan, rowIndex)) {
+        continue;
+      }
+
+      if (evaluator !== undefined && !evaluator(rowIndex)) {
         continue;
       }
 
@@ -237,30 +304,34 @@ export async function aggregateStream(
           continue;
         }
 
-        let value: Scalar;
+        if (plan.opcode === AggregateOpcode.Count) {
+          if (
+            !plan.hasColumn ||
+            plan.validity === undefined ||
+            ((plan.validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0
+          ) {
+            plan.state.count += 1;
+          }
+
+          continue;
+        }
 
         if (plan.values !== undefined) {
-          if (plan.validity !== undefined && !isValid(plan.validity, rowIndex)) {
+          if (
+            plan.validity !== undefined &&
+            ((plan.validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
+          ) {
             continue;
           }
 
-          value = plan.values[rowIndex] ?? 0;
+          updateState(plan.state, plan.opcode, plan.values[rowIndex] as number);
         } else if (plan.column !== undefined) {
-          value = plan.column.getUnchecked(rowIndex);
-        } else {
-          value = 1;
-        }
+          const value = plan.column.getUnchecked(rowIndex);
 
-        if (value === null) {
-          continue;
+          if (typeof value === 'number') {
+            updateState(plan.state, plan.opcode, value);
+          }
         }
-
-        if (typeof value !== 'number') {
-          plan.state.count += 1;
-          continue;
-        }
-
-        updateState(plan.state, plan.expression, value);
       }
     }
   }
@@ -271,15 +342,16 @@ export async function aggregateStream(
     }
   }
 
-  return finalizeStates(spec, states);
+  return finalizeStates(spec, states, expressions);
 }
 
 function createStates(
   spec: AggregateSpec,
   table: Table,
+  entries: readonly (readonly [string, AggregateExpression])[] = Object.entries(spec),
   target = new Map<string, AggregateState>(),
 ): Map<string, AggregateState> {
-  for (const [name, expression] of Object.entries(spec)) {
+  for (const [name, expression] of entries) {
     assertAggregateKind(expression.kind);
 
     if (expression.column === undefined && expression.kind !== 'count') {
@@ -299,18 +371,47 @@ function createStates(
 }
 
 function aggregateSingleNumeric(
-  plan: AggregatePlan,
+  expression: AggregateExpression,
+  values: NumericArray,
+  validity: Uint32Array | undefined,
   rowCount: number,
-  predicate: ((rowIndex: number) => boolean) | undefined,
+  predicates: NumericPredicatePlan,
   signal: AbortSignal | undefined,
-): void {
-  const values = plan.values;
-  const validity = plan.validity;
-  const state = plan.state;
-  const kind = plan.expression.kind;
+): AggregateState {
+  const state = createState();
+  const kind = expression.kind;
+  const predicateCount = predicates.operators.length;
+  let predicateGuaranteesValueValid = false;
 
-  if (values === undefined) {
-    return;
+  for (let index = 0; index < predicateCount; index += 1) {
+    if (
+      predicates.values[index] === values &&
+      predicates.operators[index] !== NumericPredicateOperator.IsNull
+    ) {
+      predicateGuaranteesValueValid = true;
+      break;
+    }
+  }
+
+  if (predicates.alwaysFalse) {
+    return state;
+  }
+
+  if (
+    kind === 'sum' &&
+    predicateCount === 1 &&
+    predicates.operators[0] === NumericPredicateOperator.GreaterThan
+  ) {
+    return aggregateSumGreaterThan(
+      values,
+      validity,
+      rowCount,
+      predicates.values[0] as NumericArray,
+      predicates.validity[0],
+      predicates.operands[0] as number,
+      state,
+      signal,
+    );
   }
 
   switch (kind) {
@@ -320,19 +421,110 @@ function aggregateSingleNumeric(
       let count = 0;
 
       for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
-        if (signal !== undefined && signal.aborted) {
+        if ((rowIndex & 4095) === 0 && signal?.aborted === true) {
           throw new AbortExecutionError();
         }
 
-        if (predicate !== undefined && !predicate(rowIndex)) {
+        if (predicateCount === 1) {
+          const bitmap = predicates.validity[0];
+          const predicateValid =
+            bitmap === undefined ||
+            ((bitmap[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
+          const predicateValue = (predicates.values[0] as NumericArray)[rowIndex] as number;
+          const operand = predicates.operands[0] as number;
+          const operator = predicates.operators[0];
+          let matches = false;
+
+          switch (operator) {
+            case NumericPredicateOperator.Equal:
+              matches = predicateValid && predicateValue === operand;
+              break;
+            case NumericPredicateOperator.NotEqual:
+              matches = predicateValid && predicateValue !== operand;
+              break;
+            case NumericPredicateOperator.GreaterThan:
+              matches = predicateValid && predicateValue > operand;
+              break;
+            case NumericPredicateOperator.GreaterThanOrEqual:
+              matches = predicateValid && predicateValue >= operand;
+              break;
+            case NumericPredicateOperator.LessThan:
+              matches = predicateValid && predicateValue < operand;
+              break;
+            case NumericPredicateOperator.LessThanOrEqual:
+              matches = predicateValid && predicateValue <= operand;
+              break;
+            case NumericPredicateOperator.IsNull:
+              matches = !predicateValid;
+              break;
+            case NumericPredicateOperator.IsNotNull:
+              matches = predicateValid;
+              break;
+          }
+
+          if (!matches) {
+            continue;
+          }
+        } else if (predicateCount > 1) {
+          let matches = true;
+
+          for (let predicateIndex = 0; predicateIndex < predicateCount; predicateIndex += 1) {
+            const bitmap = predicates.validity[predicateIndex];
+            const predicateValid =
+              bitmap === undefined ||
+              ((bitmap[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
+            const predicateValue = (predicates.values[predicateIndex] as NumericArray)[
+              rowIndex
+            ] as number;
+            const operand = predicates.operands[predicateIndex] as number;
+            const operator = predicates.operators[predicateIndex];
+
+            switch (operator) {
+              case NumericPredicateOperator.Equal:
+                matches = predicateValid && predicateValue === operand;
+                break;
+              case NumericPredicateOperator.NotEqual:
+                matches = predicateValid && predicateValue !== operand;
+                break;
+              case NumericPredicateOperator.GreaterThan:
+                matches = predicateValid && predicateValue > operand;
+                break;
+              case NumericPredicateOperator.GreaterThanOrEqual:
+                matches = predicateValid && predicateValue >= operand;
+                break;
+              case NumericPredicateOperator.LessThan:
+                matches = predicateValid && predicateValue < operand;
+                break;
+              case NumericPredicateOperator.LessThanOrEqual:
+                matches = predicateValid && predicateValue <= operand;
+                break;
+              case NumericPredicateOperator.IsNull:
+                matches = !predicateValid;
+                break;
+              case NumericPredicateOperator.IsNotNull:
+                matches = predicateValid;
+                break;
+            }
+
+            if (!matches) {
+              break;
+            }
+          }
+
+          if (!matches) {
+            continue;
+          }
+        }
+
+        if (
+          !predicateGuaranteesValueValid &&
+          validity !== undefined &&
+          ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
+        ) {
           continue;
         }
 
-        if (validity !== undefined && !isValid(validity, rowIndex)) {
-          continue;
-        }
-
-        const value = values[rowIndex] ?? 0;
+        const value = values[rowIndex] as number;
         const nextTotal = total + value;
 
         if (Number.isFinite(total) && Number.isFinite(value) && Number.isFinite(nextTotal)) {
@@ -352,26 +544,30 @@ function aggregateSingleNumeric(
       state.compensation = compensation;
       state.count = count;
 
-      return;
+      return state;
     }
     case 'mean': {
       let average = 0;
       let count = 0;
 
       for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
-        if (signal !== undefined && signal.aborted) {
+        if ((rowIndex & 4095) === 0 && signal?.aborted === true) {
           throw new AbortExecutionError();
         }
 
-        if (predicate !== undefined && !predicate(rowIndex)) {
+        if (predicateCount !== 0 && !matchesNumericPredicatePlan(predicates, rowIndex)) {
           continue;
         }
 
-        if (validity !== undefined && !isValid(validity, rowIndex)) {
+        if (
+          !predicateGuaranteesValueValid &&
+          validity !== undefined &&
+          ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
+        ) {
           continue;
         }
 
-        const value = values[rowIndex] ?? 0;
+        const value = values[rowIndex] as number;
 
         count += 1;
         average += (value - average) / count;
@@ -380,59 +576,67 @@ function aggregateSingleNumeric(
       state.mean = average;
       state.count = count;
 
-      return;
+      return state;
     }
     case 'min': {
       let minimum = Number.POSITIVE_INFINITY;
       let count = 0;
 
       for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
-        if (signal !== undefined && signal.aborted) {
+        if ((rowIndex & 4095) === 0 && signal?.aborted === true) {
           throw new AbortExecutionError();
         }
 
-        if (predicate !== undefined && !predicate(rowIndex)) {
+        if (predicateCount !== 0 && !matchesNumericPredicatePlan(predicates, rowIndex)) {
           continue;
         }
 
-        if (validity !== undefined && !isValid(validity, rowIndex)) {
+        if (
+          !predicateGuaranteesValueValid &&
+          validity !== undefined &&
+          ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
+        ) {
           continue;
         }
 
-        minimum = Math.min(minimum, values[rowIndex] ?? 0);
+        minimum = Math.min(minimum, values[rowIndex] as number);
         count += 1;
       }
 
       state.min = minimum;
       state.count = count;
 
-      return;
+      return state;
     }
     case 'max': {
       let maximum = Number.NEGATIVE_INFINITY;
       let count = 0;
 
       for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
-        if (signal !== undefined && signal.aborted) {
+        if ((rowIndex & 4095) === 0 && signal?.aborted === true) {
           throw new AbortExecutionError();
         }
 
-        if (predicate !== undefined && !predicate(rowIndex)) {
+        if (predicateCount !== 0 && !matchesNumericPredicatePlan(predicates, rowIndex)) {
           continue;
         }
 
-        if (validity !== undefined && !isValid(validity, rowIndex)) {
+        if (
+          !predicateGuaranteesValueValid &&
+          validity !== undefined &&
+          ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
+        ) {
           continue;
         }
 
-        maximum = Math.max(maximum, values[rowIndex] ?? 0);
+        maximum = Math.max(maximum, values[rowIndex] as number);
         count += 1;
       }
 
       state.max = maximum;
       state.count = count;
 
-      return;
+      return state;
     }
     case 'variance': {
       let average = 0;
@@ -440,19 +644,23 @@ function aggregateSingleNumeric(
       let count = 0;
 
       for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
-        if (signal !== undefined && signal.aborted) {
+        if ((rowIndex & 4095) === 0 && signal?.aborted === true) {
           throw new AbortExecutionError();
         }
 
-        if (predicate !== undefined && !predicate(rowIndex)) {
+        if (predicateCount !== 0 && !matchesNumericPredicatePlan(predicates, rowIndex)) {
           continue;
         }
 
-        if (validity !== undefined && !isValid(validity, rowIndex)) {
+        if (
+          !predicateGuaranteesValueValid &&
+          validity !== undefined &&
+          ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
+        ) {
           continue;
         }
 
-        const value = values[rowIndex] ?? 0;
+        const value = values[rowIndex] as number;
 
         count += 1;
         const delta = value - average;
@@ -465,29 +673,241 @@ function aggregateSingleNumeric(
       state.m2 = m2;
       state.count = count;
 
-      return;
+      return state;
     }
     case 'count': {
       let count = 0;
 
       for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
-        if (signal !== undefined && signal.aborted) {
+        if ((rowIndex & 4095) === 0 && signal?.aborted === true) {
           throw new AbortExecutionError();
         }
 
-        if (predicate !== undefined && !predicate(rowIndex)) {
+        if (predicateCount !== 0 && !matchesNumericPredicatePlan(predicates, rowIndex)) {
           continue;
         }
 
-        if (validity === undefined || isValid(validity, rowIndex)) {
+        if (
+          predicateGuaranteesValueValid ||
+          validity === undefined ||
+          ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0
+        ) {
           count += 1;
         }
       }
 
       state.count = count;
 
-      return;
+      return state;
     }
+  }
+}
+
+function aggregateSumGreaterThan(
+  values: NumericArray,
+  validity: Uint32Array | undefined,
+  rowCount: number,
+  predicateValues: NumericArray,
+  predicateValidity: Uint32Array | undefined,
+  threshold: number,
+  state: AggregateState,
+  signal: AbortSignal | undefined,
+): AggregateState {
+  const sharedValues = values === predicateValues;
+  let total = 0;
+  let compensation = 0;
+  let count = 0;
+
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+    if ((rowIndex & 4095) === 0 && signal?.aborted === true) {
+      throw new AbortExecutionError();
+    }
+
+    if (
+      predicateValidity !== undefined &&
+      ((predicateValidity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
+    ) {
+      continue;
+    }
+
+    if (!((predicateValues[rowIndex] as number) > threshold)) {
+      continue;
+    }
+
+    if (
+      !sharedValues &&
+      validity !== undefined &&
+      ((validity[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) === 0
+    ) {
+      continue;
+    }
+
+    const value = values[rowIndex] as number;
+    const nextTotal = total + value;
+
+    if (Number.isFinite(total) && Number.isFinite(value) && Number.isFinite(nextTotal)) {
+      compensation +=
+        Math.abs(total) >= Math.abs(value) ? total - nextTotal + value : value - nextTotal + total;
+    } else {
+      compensation = 0;
+    }
+
+    total = nextTotal;
+    count += 1;
+  }
+
+  state.sum = total;
+  state.compensation = compensation;
+  state.count = count;
+
+  return state;
+}
+
+function matchesNumericPredicatePlan(plan: NumericPredicatePlan, rowIndex: number): boolean {
+  const { values, validity, operators, operands } = plan;
+  const predicateCount = operators.length;
+
+  if (predicateCount === 1) {
+    const bitmap = validity[0];
+    const valid =
+      bitmap === undefined || ((bitmap[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
+    const operator = operators[0];
+
+    switch (operator) {
+      case NumericPredicateOperator.Equal:
+        return valid && (values[0] as NumericArray)[rowIndex] === operands[0];
+      case NumericPredicateOperator.NotEqual:
+        return valid && (values[0] as NumericArray)[rowIndex] !== operands[0];
+      case NumericPredicateOperator.GreaterThan:
+        return valid && ((values[0] as NumericArray)[rowIndex] as number) > (operands[0] as number);
+      case NumericPredicateOperator.GreaterThanOrEqual:
+        return (
+          valid && ((values[0] as NumericArray)[rowIndex] as number) >= (operands[0] as number)
+        );
+      case NumericPredicateOperator.LessThan:
+        return valid && ((values[0] as NumericArray)[rowIndex] as number) < (operands[0] as number);
+      case NumericPredicateOperator.LessThanOrEqual:
+        return (
+          valid && ((values[0] as NumericArray)[rowIndex] as number) <= (operands[0] as number)
+        );
+      case NumericPredicateOperator.IsNull:
+        return !valid;
+      case NumericPredicateOperator.IsNotNull:
+        return valid;
+      default:
+        return false;
+    }
+  }
+
+  for (let predicateIndex = 0; predicateIndex < predicateCount; predicateIndex += 1) {
+    const bitmap = validity[predicateIndex];
+    const valid =
+      bitmap === undefined || ((bitmap[rowIndex >>> 5] as number) & (1 << (rowIndex & 31))) !== 0;
+    const operator = operators[predicateIndex];
+
+    switch (operator) {
+      case NumericPredicateOperator.Equal:
+        if (
+          !valid ||
+          (values[predicateIndex] as NumericArray)[rowIndex] !== operands[predicateIndex]
+        ) {
+          return false;
+        }
+
+        break;
+      case NumericPredicateOperator.NotEqual:
+        if (
+          !valid ||
+          (values[predicateIndex] as NumericArray)[rowIndex] === operands[predicateIndex]
+        ) {
+          return false;
+        }
+
+        break;
+      case NumericPredicateOperator.GreaterThan:
+        if (
+          !valid ||
+          !(
+            ((values[predicateIndex] as NumericArray)[rowIndex] as number) >
+            (operands[predicateIndex] as number)
+          )
+        ) {
+          return false;
+        }
+
+        break;
+      case NumericPredicateOperator.GreaterThanOrEqual:
+        if (
+          !valid ||
+          !(
+            ((values[predicateIndex] as NumericArray)[rowIndex] as number) >=
+            (operands[predicateIndex] as number)
+          )
+        ) {
+          return false;
+        }
+
+        break;
+      case NumericPredicateOperator.LessThan:
+        if (
+          !valid ||
+          !(
+            ((values[predicateIndex] as NumericArray)[rowIndex] as number) <
+            (operands[predicateIndex] as number)
+          )
+        ) {
+          return false;
+        }
+
+        break;
+      case NumericPredicateOperator.LessThanOrEqual:
+        if (
+          !valid ||
+          !(
+            ((values[predicateIndex] as NumericArray)[rowIndex] as number) <=
+            (operands[predicateIndex] as number)
+          )
+        ) {
+          return false;
+        }
+
+        break;
+      case NumericPredicateOperator.IsNull:
+        if (valid) {
+          return false;
+        }
+
+        break;
+      case NumericPredicateOperator.IsNotNull:
+        if (!valid) {
+          return false;
+        }
+
+        break;
+      default:
+        return false;
+    }
+  }
+
+  return true;
+}
+
+function finalizeSingle(expression: AggregateExpression, state: AggregateState): number | null {
+  switch (expression.kind) {
+    case 'count':
+      return state.count;
+    case 'sum':
+      return state.count === 0 ? null : state.sum + state.compensation;
+    case 'mean':
+      return state.count === 0 ? null : state.mean;
+    case 'min':
+      return state.count === 0 ? null : state.min;
+    case 'max':
+      return state.count === 0 ? null : state.max;
+    case 'variance':
+      return state.count === 0 || (expression.sample === true && state.count < 2)
+        ? null
+        : state.m2 / (state.count - (expression.sample === true ? 1 : 0));
   }
 }
 
@@ -530,13 +950,30 @@ function createState(): AggregateState {
   };
 }
 
-function updateState(state: AggregateState, expression: AggregateExpression, value: number): void {
+function getAggregateOpcode(kind: AggregateKind): AggregateOpcode {
+  switch (kind) {
+    case 'sum':
+      return AggregateOpcode.Sum;
+    case 'mean':
+      return AggregateOpcode.Mean;
+    case 'min':
+      return AggregateOpcode.Min;
+    case 'max':
+      return AggregateOpcode.Max;
+    case 'count':
+      return AggregateOpcode.Count;
+    case 'variance':
+      return AggregateOpcode.Variance;
+  }
+}
+
+function updateState(state: AggregateState, opcode: AggregateOpcode, value: number): void {
   state.count += 1;
 
-  switch (expression.kind) {
-    case 'count':
+  switch (opcode) {
+    case AggregateOpcode.Count:
       return;
-    case 'sum': {
+    case AggregateOpcode.Sum: {
       const nextSum = state.sum + value;
 
       if (Number.isFinite(state.sum) && Number.isFinite(value) && Number.isFinite(nextSum)) {
@@ -552,20 +989,20 @@ function updateState(state: AggregateState, expression: AggregateExpression, val
 
       return;
     }
-    case 'mean': {
+    case AggregateOpcode.Mean: {
       state.mean += (value - state.mean) / state.count;
 
       return;
     }
-    case 'min':
+    case AggregateOpcode.Min:
       state.min = Math.min(state.min, value);
 
       return;
-    case 'max':
+    case AggregateOpcode.Max:
       state.max = Math.max(state.max, value);
 
       return;
-    case 'variance': {
+    case AggregateOpcode.Variance: {
       const delta = value - state.mean;
 
       state.mean += delta / state.count;
@@ -579,10 +1016,11 @@ function updateState(state: AggregateState, expression: AggregateExpression, val
 function finalizeStates(
   spec: AggregateSpec,
   states: ReadonlyMap<string, AggregateState>,
+  entries: readonly (readonly [string, AggregateExpression])[] = Object.entries(spec),
 ): Record<string, number | null> {
   const result: Record<string, number | null> = {};
 
-  for (const [name, expression] of Object.entries(spec)) {
+  for (const [name, expression] of entries) {
     const state = states.get(name);
 
     if (state === undefined) {
@@ -618,6 +1056,18 @@ function finalizeStates(
   }
 
   return result;
+}
+
+function getColumnValidity(column: Column | undefined): Uint32Array | undefined {
+  if (
+    column instanceof NumericColumn ||
+    column instanceof BooleanColumn ||
+    column instanceof DictionaryColumn
+  ) {
+    return column.validity;
+  }
+
+  return undefined;
 }
 
 function isAborted(signal: AbortSignal | undefined): boolean {

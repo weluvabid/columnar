@@ -19,6 +19,20 @@ export abstract class Column {
   abstract readonly length: number;
   abstract getUnchecked(index: number): Scalar;
   abstract take(indices: Uint32Array): Column;
+  /** @internal Validates and copies a selection prefix. */
+  takeValidated(indices: Uint32Array, length: number): Column {
+    const selection = length === indices.length ? indices : indices.subarray(0, length);
+
+    return this.take(selection);
+  }
+
+  /** @internal Copies a previously validated selection into a compact column. */
+  takeUnchecked(indices: Uint32Array, length: number): Column {
+    const selection = length === indices.length ? indices : indices.subarray(0, length);
+
+    return this.take(selection);
+  }
+
   abstract getNullCount(): number;
 
   get(index: number): Scalar {
@@ -68,21 +82,58 @@ export class NumericColumn extends Column {
   }
 
   take(indices: Uint32Array): NumericColumn {
+    return this.takeValidated(indices, indices.length);
+  }
+
+  override takeValidated(indices: Uint32Array, length: number): NumericColumn {
     const Constructor = this.values.constructor as new (length: number) => NumericArray;
-    const values = new Constructor(indices.length);
+    const values = new Constructor(length);
     let validity: Uint32Array | undefined;
 
-    for (let target = 0; target < indices.length; target += 1) {
+    for (let target = 0; target < length; target += 1) {
       const source = indices[target] as number;
 
-      this.assertIndex(source);
+      if (source >= this.length) {
+        throw new RangeError(`Column index ${source} is outside [0, ${this.length}).`);
+      }
 
       if (
         this.validity !== undefined &&
         ((this.validity[source >>> 5] as number) & (1 << (source & 31))) === 0
       ) {
         if (validity === undefined) {
-          validity = new Uint32Array(Math.ceil(indices.length / 32));
+          validity = new Uint32Array(Math.ceil(length / 32));
+
+          setValidPrefix(validity, target);
+        }
+
+        continue;
+      }
+
+      values[target] = this.values[source] as number;
+
+      if (validity !== undefined) {
+        (validity[target >>> 5] as number) |= 1 << (target & 31);
+      }
+    }
+
+    return new NumericColumn(values, validity);
+  }
+
+  override takeUnchecked(indices: Uint32Array, length: number): NumericColumn {
+    const Constructor = this.values.constructor as new (length: number) => NumericArray;
+    const values = new Constructor(length);
+    let validity: Uint32Array | undefined;
+
+    for (let target = 0; target < length; target += 1) {
+      const source = indices[target] as number;
+
+      if (
+        this.validity !== undefined &&
+        ((this.validity[source >>> 5] as number) & (1 << (source & 31))) === 0
+      ) {
+        if (validity === undefined) {
+          validity = new Uint32Array(Math.ceil(length / 32));
 
           setValidPrefix(validity, target);
         }
@@ -138,20 +189,56 @@ export class BooleanColumn extends Column {
   }
 
   take(indices: Uint32Array): BooleanColumn {
-    const values = new Uint8Array(indices.length);
+    return this.takeValidated(indices, indices.length);
+  }
+
+  override takeValidated(indices: Uint32Array, length: number): BooleanColumn {
+    const values = new Uint8Array(length);
     let validity: Uint32Array | undefined;
 
-    for (let target = 0; target < indices.length; target += 1) {
+    for (let target = 0; target < length; target += 1) {
       const source = indices[target] as number;
 
-      this.assertIndex(source);
+      if (source >= this.length) {
+        throw new RangeError(`Column index ${source} is outside [0, ${this.length}).`);
+      }
 
       if (
         this.validity !== undefined &&
         ((this.validity[source >>> 5] as number) & (1 << (source & 31))) === 0
       ) {
         if (validity === undefined) {
-          validity = new Uint32Array(Math.ceil(indices.length / 32));
+          validity = new Uint32Array(Math.ceil(length / 32));
+
+          setValidPrefix(validity, target);
+        }
+
+        continue;
+      }
+
+      values[target] = this.values[source] as number;
+
+      if (validity !== undefined) {
+        (validity[target >>> 5] as number) |= 1 << (target & 31);
+      }
+    }
+
+    return new BooleanColumn(values, validity);
+  }
+
+  override takeUnchecked(indices: Uint32Array, length: number): BooleanColumn {
+    const values = new Uint8Array(length);
+    let validity: Uint32Array | undefined;
+
+    for (let target = 0; target < length; target += 1) {
+      const source = indices[target] as number;
+
+      if (
+        this.validity !== undefined &&
+        ((this.validity[source >>> 5] as number) & (1 << (source & 31))) === 0
+      ) {
+        if (validity === undefined) {
+          validity = new Uint32Array(Math.ceil(length / 32));
 
           setValidPrefix(validity, target);
         }
@@ -216,20 +303,56 @@ export class DictionaryColumn extends Column {
   }
 
   take(indices: Uint32Array): DictionaryColumn {
-    const values = new Uint32Array(indices.length);
+    return this.takeValidated(indices, indices.length);
+  }
+
+  override takeValidated(indices: Uint32Array, length: number): DictionaryColumn {
+    const values = new Uint32Array(length);
     let validity: Uint32Array | undefined;
 
-    for (let target = 0; target < indices.length; target += 1) {
+    for (let target = 0; target < length; target += 1) {
       const source = indices[target] as number;
 
-      this.assertIndex(source);
+      if (source >= this.length) {
+        throw new RangeError(`Column index ${source} is outside [0, ${this.length}).`);
+      }
 
       if (
         this.validity !== undefined &&
         ((this.validity[source >>> 5] as number) & (1 << (source & 31))) === 0
       ) {
         if (validity === undefined) {
-          validity = new Uint32Array(Math.ceil(indices.length / 32));
+          validity = new Uint32Array(Math.ceil(length / 32));
+
+          setValidPrefix(validity, target);
+        }
+
+        continue;
+      }
+
+      values[target] = this.indices[source] as number;
+
+      if (validity !== undefined) {
+        (validity[target >>> 5] as number) |= 1 << (target & 31);
+      }
+    }
+
+    return new DictionaryColumn(values, this.dictionary, validity);
+  }
+
+  override takeUnchecked(indices: Uint32Array, length: number): DictionaryColumn {
+    const values = new Uint32Array(length);
+    let validity: Uint32Array | undefined;
+
+    for (let target = 0; target < length; target += 1) {
+      const source = indices[target] as number;
+
+      if (
+        this.validity !== undefined &&
+        ((this.validity[source >>> 5] as number) & (1 << (source & 31))) === 0
+      ) {
+        if (validity === undefined) {
+          validity = new Uint32Array(Math.ceil(length / 32));
 
           setValidPrefix(validity, target);
         }

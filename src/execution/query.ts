@@ -52,11 +52,10 @@ export class QueryBuilder {
   }
 
   execute(): Table {
-    const source =
-      this.#projection === undefined ? this.#table : this.#table.selectColumns(this.#projection);
-
     if (this.#predicates.length === 0) {
-      return source;
+      return this.#projection === undefined
+        ? this.#table
+        : this.#table.selectColumns(this.#projection);
     }
 
     const evaluators = this.#predicates.map((predicate) => predicate.bind(this.#table));
@@ -87,7 +86,7 @@ export class QueryBuilder {
         selectedCount += 1;
       }
 
-      return source.take(indices.subarray(0, selectedCount));
+      return this.#table.takeSelectionUnchecked(indices, selectedCount, this.#projection);
     }
 
     const sampleSize = SELECTION_SAMPLE_SIZE;
@@ -110,7 +109,10 @@ export class QueryBuilder {
     if (estimatedCapacity > capacity) {
       const expanded = new Uint32Array(estimatedCapacity);
 
-      expanded.set(indices.subarray(0, selectedCount));
+      for (let index = 0; index < selectedCount; index += 1) {
+        expanded[index] = indices[index] as number;
+      }
+
       indices = expanded;
       capacity = estimatedCapacity;
     }
@@ -132,7 +134,7 @@ export class QueryBuilder {
       selectedCount += 1;
     }
 
-    return source.take(indices.subarray(0, selectedCount));
+    return this.#table.takeSelectionUnchecked(indices, selectedCount, this.#projection);
   }
 }
 

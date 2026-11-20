@@ -224,21 +224,81 @@ export class Table {
   }
 
   take(indices: Uint32Array): Table {
-    if (this.#columns.size === 0) {
-      for (let index = 0; index < indices.length; index += 1) {
-        if ((indices[index] ?? 0) >= this.rowCount) {
-          throw new RangeError(`Row index ${indices[index]} is outside [0, ${this.rowCount}).`);
+    return this.takeSelection(indices, indices.length);
+  }
+
+  /** @internal Validates and materializes a prefix of selected rows. */
+  takeSelection(
+    indices: Uint32Array,
+    selectedCount: number,
+    projection?: readonly string[],
+  ): Table {
+    this.assertSelectionLength(indices, selectedCount);
+
+    return this.materializeSelection(indices, selectedCount, projection, true);
+  }
+
+  /** @internal Materializes indices produced by this table's query executor. */
+  takeSelectionUnchecked(
+    indices: Uint32Array,
+    selectedCount: number,
+    projection?: readonly string[],
+  ): Table {
+    this.assertSelectionLength(indices, selectedCount);
+
+    return this.materializeSelection(indices, selectedCount, projection, false);
+  }
+
+  private assertSelectionLength(indices: Uint32Array, selectedCount: number): void {
+    if (!Number.isInteger(selectedCount) || selectedCount < 0 || selectedCount > indices.length) {
+      throw new RangeError('Selected row count must be within the selection buffer bounds.');
+    }
+  }
+
+  private materializeSelection(
+    indices: Uint32Array,
+    selectedCount: number,
+    projection: readonly string[] | undefined,
+    validateIndices: boolean,
+  ): Table {
+    const columns = new Map<string, Column>();
+    let validated = !validateIndices;
+
+    const takeColumn = (column: Column): Column => {
+      if (!validated) {
+        validated = true;
+
+        return column.takeValidated(indices, selectedCount);
+      }
+
+      return column.takeUnchecked(indices, selectedCount);
+    };
+
+    if (projection === undefined) {
+      for (const [name, column] of this.#columns) {
+        columns.set(name, takeColumn(column));
+      }
+    } else {
+      for (const name of projection) {
+        if (columns.has(name)) {
+          throw new SchemaError(`Column '${name}' was selected more than once.`);
+        }
+
+        columns.set(name, takeColumn(this.column(name)));
+      }
+    }
+
+    if (!validated) {
+      for (let index = 0; index < selectedCount; index += 1) {
+        const source = indices[index] as number;
+
+        if (source >= this.rowCount) {
+          throw new RangeError(`Row index ${source} is outside [0, ${this.rowCount}).`);
         }
       }
     }
 
-    const columns = new Map<string, Column>();
-
-    for (const [name, column] of this.#columns) {
-      columns.set(name, column.take(indices));
-    }
-
-    return new Table(columns, indices.length);
+    return new Table(columns, selectedCount);
   }
 
   selectColumns(names: readonly string[]): Table {

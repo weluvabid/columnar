@@ -19,6 +19,36 @@ describe('query execution', () => {
     expect(result.toRows()).toEqual([{ speed: 120, mode: 'sport' }]);
   });
 
+  it('filters on unprojected columns and materializes only the requested projection', () => {
+    const result = table({
+      id: [10, 20, 30, 40],
+      score: [1, 5, 3, 8],
+      mode: ['eco', 'sport', 'eco', 'sport'],
+    })
+      .query()
+      .filter(col('score').gte(5))
+      .select('id', 'mode')
+      .execute();
+
+    expect(result.columnNames).toEqual(['id', 'mode']);
+    expect(result.toRows()).toEqual([
+      { id: 20, mode: 'sport' },
+      { id: 40, mode: 'sport' },
+    ]);
+  });
+
+  it('preserves the projected schema when a filter selects no rows', () => {
+    const result = table({ id: [1, 2], score: [10, 20] })
+      .query()
+      .filter(col('score').gt(100))
+      .select('id')
+      .execute();
+
+    expect(result.rowCount).toBe(0);
+    expect(result.columnNames).toEqual(['id']);
+    expect(result.column('id').length).toBe(0);
+  });
+
   it('grows sparse selection buffers when later rows are denser than the sample', () => {
     const values = new Float64Array(10_000);
 

@@ -116,6 +116,25 @@ describe('Table', () => {
     expect(selected.toRows()).toEqual([{ value: 1 }, { value: 3 }]);
   });
 
+  it('materializes only the selected prefix of a selection buffer', () => {
+    const source = table({
+      id: [10, 20, 30],
+      mode: ['eco', 'sport', 'track'],
+    });
+    const selected = source.takeSelection(new Uint32Array([2, 0, 99]), 2, ['mode']);
+
+    expect(selected.columnNames).toEqual(['mode']);
+    expect(selected.toRows()).toEqual([{ mode: 'track' }, { mode: 'eco' }]);
+  });
+
+  it('validates selection indices once while materializing a table', () => {
+    const source = table({ first: [1, 2], second: ['a', 'b'] });
+
+    expect(() => source.take(new Uint32Array([0, 2]))).toThrow(RangeError);
+    expect(() => source.takeSelection(new Uint32Array([0]), 2)).toThrow(RangeError);
+    expect(() => source.takeSelection(new Uint32Array([0]), -1)).toThrow(RangeError);
+  });
+
   it('rejects columns with different lengths', () => {
     expect(() => Table.fromColumns({ a: [1, 2], b: [1] })).toThrow(SchemaError);
   });

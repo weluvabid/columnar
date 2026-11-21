@@ -22,7 +22,7 @@
   "type": "module",
   "sideEffects": false,
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=26.13.0"
   },
   "packageManager": "pnpm@12.0.0",
   "main": "./dist/index.js",

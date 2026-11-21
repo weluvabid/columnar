@@ -20,7 +20,7 @@
     "skipLibCheck": true,
     "types": ["node", "vitest/globals"],
     "baseUrl": ".",
-    "paths": { "@columnar/core": ["./src/index.ts"] }
+    "paths": { "@columnar-js/core": ["./src/index.ts"] }
   },
   "include": [
     "src/**/*.ts",

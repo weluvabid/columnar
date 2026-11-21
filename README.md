@@ -11,7 +11,7 @@ I wanted a way to keep the convenience of working with composable data operation
 Columnar keeps tabular data in contiguous typed-array buffers, compiles predicates once per execution, and runs filtered aggregations in a fused traversal. It is designed for application workloads that need fast in-process analytics without converting every row into an intermediate object.
 
 ```ts
-import { col, count, mean, sum, table } from '@columnar/core';
+import { col, count, mean, sum, table } from '@columnar-js/core';
 
 const vehicles = table({
   timestamp: new Float64Array([0, 10, 20, 30]),
@@ -56,7 +56,7 @@ The goal isn't to replace hand-written loops. It's to make efficient, composable
 ## Install
 
 ```sh
-pnpm add @columnar/core
+pnpm add @columnar-js/core
 ```
 
 ## Input
@@ -66,7 +66,7 @@ pnpm add @columnar/core
 Use typed arrays for the direct columnar path. Typed-array inputs are retained by reference; the table and caller share their backing buffers.
 
 ```ts
-import { table } from '@columnar/core';
+import { table } from '@columnar-js/core';
 
 const dataset = table({
   timestamp: new Float64Array([0, 10, 20]),
@@ -105,7 +105,7 @@ const fastVehicles = dataset
 ### Aggregation
 
 ```ts
-import { count, max, mean, min, sum, variance } from '@columnar/core';
+import { count, max, mean, min, sum, variance } from '@columnar-js/core';
 
 const summary = dataset
   .query()
@@ -141,7 +141,7 @@ Available comparisons: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `isNull`, and `isNo
 `aggregateStream` consumes an `AsyncIterable<Table>` one chunk at a time. It retains aggregate state, not prior chunks, and requests the next chunk only after processing the current one.
 
 ```ts
-import { aggregateStream, count, mean, sum, table } from '@columnar/core';
+import { aggregateStream, count, mean, sum, table } from '@columnar-js/core';
 
 async function* readBatches() {
   yield table({ temperature: new Float32Array([21.5, 27.2, 29.1]) });
@@ -204,7 +204,7 @@ pnpm bench -- --large
 
 `pnpm check` runs type checking, ESLint, Prettier validation, tests, and the package build. The benchmark compares Columnar's fused query with a hand-written typed-array loop and materializing JavaScript pipelines. The loop is a useful workload-specific reference; Columnar provides the reusable query model around filtering, null handling, aggregation and streaming. Run comparisons on the same machine and Node.js version.
 
-Each example can be opened as a StackBlitz project after `@columnar/core` is published to npm.
+Each example can be opened as a StackBlitz project after `@columnar-js/core` is published to npm.
 
 ## License
 

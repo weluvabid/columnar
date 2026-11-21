@@ -58,17 +58,17 @@
     "bench:advanced": "node --expose-gc --import tsx benchmarks/advanced.ts"
   },
   "devDependencies": {
-    "@eslint/js": "9.39.1",
-    "@types/node": "24.10.0",
-    "eslint": "9.39.1",
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.6.6",
+    "eslint": "10.15.0",
     "eslint-config-prettier": "10.1.8",
-    "fast-check": "4.3.0",
-    "globals": "16.5.0",
-    "prettier": "3.6.2",
-    "tsup": "8.5.0",
-    "tsx": "4.20.6",
-    "typescript": "5.9.3",
-    "typescript-eslint": "8.46.4",
-    "vitest": "3.2.4"
+    "fast-check": "4.10.2",
+    "globals": "17.14.0",
+    "prettier": "3.10.1",
+    "tsup": "9.0.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "typescript-eslint": "8.73.0",
+    "vitest": "5.1.0"
   }
 }

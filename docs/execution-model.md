@@ -4,7 +4,7 @@
 
 `col(name)` creates an immutable expression node. Expressions compose through `and`, `or`, and `not`. Before execution, the engine resolves referenced columns and compiles the expression tree into a row predicate.
 
-Consecutive `and` nodes containing numeric comparisons and null checks can be flattened into a compact execution plan. The plan stores numeric operator opcodes in a `Uint8Array`, comparison operands in a `Float64Array`, and references to the bound column buffers. `or` and `not` retain the general compiled-predicate path so short-circuit and grouping semantics remain unchanged.
+Consecutive `and` nodes containing numeric comparisons and null checks can be flattened into a compact execution plan. The plan stores numeric operator opcodes in a `Uint8Array`, comparison operands in a `Float64Array`, and references to the bound column buffers. A 3-bit packed representation was evaluated but not adopted: it saves only a handful of bytes for realistic predicate counts while adding bit extraction to the per-row hot path. In the local Node.js 22.16.0 diagnostic run, packed dispatch was 1.23–1.38x slower for 2–8 predicates. `or` and `not` retain the general compiled-predicate path so short-circuit and grouping semantics remain unchanged.
 
 Dictionary equality predicates resolve their string operand to a dictionary index once, then compare encoded indices during row traversal. Boolean predicates read their byte representation directly. Null predicates inspect validity bits without decoding values.
 
@@ -24,7 +24,7 @@ Abort signals are checked before execution and periodically during long synchron
 
 ## Selection
 
-Filtered queries use a sampled selectivity estimate to size a compact row-index buffer, then grow geometrically if the sample underestimates later matches. This retains indirect copying for selected rows instead of scanning every source row for dense bitmaps; local comparisons found the index representation faster for most tested selectivities and projection widths.
+Filtered queries sample the first 1,024 rows to estimate selectivity, allocate a compact row-index buffer with 12.5% headroom, then grow geometrically if the sample underestimates later matches. This adds some execution overhead compared with a full-capacity index buffer, but substantially reduces transient index memory for sparse selections. The adaptive strategy is retained as the memory-conscious default; the advanced benchmark reports both timings and the estimated capacity trade-off.
 
 ## Output
 

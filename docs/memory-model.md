@@ -23,7 +23,7 @@ Queries are synchronous and read the input buffers during execution. Callers mus
 - `Table.fromColumns` retains typed-array buffers.
 - `Table.fromRows` allocates typed column buffers and converts row values once. Column type inference and validity detection share a pass.
 - `select` creates a new table/schema view and reuses selected column objects.
-- `filter().execute()` uses a sampled, geometrically grown row-index selection buffer and allocates compact output buffers. `take()` allocates an output validity bitmap only if the selected output actually contains nulls.
+- `filter().execute()` samples the first 1,024 rows, sizes a row-index buffer with 12.5% headroom, and grows geometrically if necessary. This reduces transient index memory for sparse selections at some throughput cost versus a full-capacity index buffer. Output columns are compact; `take()` allocates an output validity bitmap only if the selected output actually contains nulls.
 - `aggregateStream` reuses aggregate-plan objects across chunks; chunk-local typed-array references and predicate bindings are refreshed for each chunk.
 - `aggregate().execute()` allocates aggregate state and result fields, not intermediate tables.
 - `aggregateStream` retains aggregate state and the current producer-supplied chunk.

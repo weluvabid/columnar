@@ -2,21 +2,21 @@
 
 Run `pnpm bench` for 100K and 1M rows. Add `--large` to include 10M rows.
 
-The benchmark compares three equivalent filter-and-sum workloads:
+The main benchmark runs the same filter-and-sum workload through four implementations:
 
-1. Columnar fused predicate and aggregation.
-2. A native JavaScript loop over the same `Float64Array`.
-3. A JavaScript `Array.from(...).filter(...).reduce(...)` pipeline that materializes intermediate arrays.
-4. For datasets up to 1M rows, an object-array `filter(...).reduce(...)` pipeline.
+1. Columnar's fused predicate and aggregation.
+2. A hand-written JavaScript loop over the same `Float64Array`.
+3. A typed-array pipeline using `filter` and `reduce`, with an intermediate result.
+4. An object-array `filter` and `reduce` pipeline for datasets up to 1M rows.
 
-Each case runs three warmups and seven measured iterations. The median duration is reported. The runner checks that all three implementations return equivalent results before printing comparisons.
+Each implementation gets three warmups and seven measured iterations. The median duration is reported, and the runner checks that the results agree before printing timings. Heap and ArrayBuffer deltas are sampled around each operation; `node --expose-gc` requests a collection before each sample.
 
-The heap and ArrayBuffer deltas are sampled around each operation and averaged. They are runtime memory observations, not a complete allocation profiler. The runner uses `node --expose-gc` to request a collection before each sample.
+The hand-written loop is useful as a direct, workload-specific reference. It also puts the loop, null handling, composition and maintenance of that operation in the application. Columnar gives those operations a reusable query model, so application code can describe what it needs while the engine handles the execution path.
 
 ## Advanced execution benchmarks
 
-Run `pnpm bench:advanced` to measure selection/projection selectivity, multi-aggregate execution, and streaming chunk-size sensitivity. This benchmark uses a 1M-row dataset and reports medians after two warmups and five measured iterations.
+Run `pnpm bench:advanced` for selection/projection, predicate opcode representation, multi-aggregate execution, streaming chunk-size sensitivity and validity-bitmap null counting. The benchmark uses a 1M-row dataset for query scenarios, with a separate 10M-row bitmap for null counting. It reports medians after two warmups and five measured iterations.
 
-Selection scenarios vary selectivity (1%, 10%, 50%, 90%) and projected width (1, 4, 8 columns). The adaptive query path is compared with a full-capacity row-index reference to expose the memory-versus-throughput trade-off. On the latest reported run, adaptive selection was 1.11–2.31x slower, but its estimated index capacity ranged from about 12.1K entries at 1% selectivity, 120.9K at 10%, 575.7K at 50%, and 1M at 90%, versus a fixed 1M-entry reference. The adaptive path remains because the sparse-case reduction in transient index memory is substantial. A separate bitmap materialization experiment was not retained in production because index-based copying was faster in most tested combinations. The opcode section compares byte-wide operator storage with a 3-bit packed experiment. Multi-aggregate execution compares one fused query with seven independent aggregate scans. Streaming uses preconstructed chunks to isolate aggregation and chunk-processing overhead for chunk sizes from 1K to 256K rows.
+Selection scenarios vary selectivity (1%, 10%, 50%, 90%) and projected width (1, 4, 8 columns). The adaptive query path is compared with a full-capacity row-index reference. The output reports both execution time and estimated index capacity, which makes the memory/throughput trade-off visible.
 
-These are diagnostic microbenchmarks. Run them on the target machine, preserve the raw output, and compare repeated runs; do not combine their timings with the primary filter-and-sum benchmark.
+The opcode section compares byte-wide operator storage with a 3-bit packed experiment. Multi-aggregate execution compares one fused query with seven independent aggregate scans. Streaming uses preconstructed chunks to isolate aggregation and chunk-processing overhead for chunk sizes from 1K to 256K rows. The validity section compares the engine's SWAR population count with set-bit clearing over the same bitmap.

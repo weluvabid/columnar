@@ -1,4 +1,10 @@
-# Columnar
+# Why Columnar?
+
+I built Columnar because I’ve always been a little uneasy about what happens underneath seemingly simple data operations. Whenever I see a pipeline chaining filter, map and reduce, I find myself thinking about how many times we’re traversing the same data and how many intermediate arrays we’re creating along the way. For small datasets, that’s rarely a problem. The code is readable, it works, and there’s no reason to overthink it. But scale changes things. When you’re processing millions of values, particularly in a browser where you still want to maintain a smooth 60 FPS experience, those repeated passes and allocations start to matter.
+
+I wanted a way to keep the convenience of working with composable data operations without making every developer worry about how they’re executed.
+
+# What is Columnar?
 
 **A typed-array-native data processing engine for JavaScript and TypeScript.**
 
@@ -38,6 +44,14 @@ console.log(result);
 - Neumaier compensated summation, online mean, and Welford population/sample variance.
 - Chunk-at-a-time asynchronous aggregation with upstream backpressure.
 - ESM output and TypeScript declarations, with no runtime dependencies.
+
+## Why Columnar
+
+A hand-written loop is a good choice when an operation is fixed and the application needs direct control over every step. It can be very lean, but the application also owns the predicate logic, null handling, aggregation rules, composition and ongoing maintenance.
+
+Columnar gives that work a reusable home. Describe the operation with predicates and aggregate expressions; the engine binds the columns, chooses an execution path and runs the work over the underlying buffers. Your application stays focused on what the data means instead of rebuilding the mechanics for every query.
+
+The goal isn't to replace hand-written loops. It's to make efficient, composable data operations practical without making every caller write a small execution engine.
 
 ## Install
 
@@ -170,6 +184,13 @@ The direct typed-array path is zero-copy. Mutations to a caller-owned typed arra
 
 A fused aggregate query allocates aggregate state proportional to the number of requested aggregates. It does not allocate an intermediate result table. A filtered table query allocates a selection index buffer and compact output buffers. Streaming aggregation retains only the current input chunk and aggregate state.
 
+## Under the hood
+
+- [Architecture](docs/architecture.md) — how tables, predicates and execution fit together.
+- [Execution model](docs/execution-model.md) — predicate compilation, aggregation and streaming.
+- [Memory model](docs/memory-model.md) — column buffers, validity maps and allocation boundaries.
+- [Benchmark methodology](docs/benchmark-methodology.md) and [latest results](docs/benchmark-results.md).
+
 ## Development
 
 Requires Node.js 26.13.0 and pnpm 12.0.0.
@@ -181,7 +202,7 @@ pnpm bench
 pnpm bench -- --large
 ```
 
-`pnpm check` runs type checking, ESLint, Prettier validation, tests, and the package build. The benchmark compares the fused Columnar query with a native typed-array loop and a materializing JavaScript pipeline. Run benchmarks on an otherwise idle machine using the same Node.js build for repeatable comparisons.
+`pnpm check` runs type checking, ESLint, Prettier validation, tests, and the package build. The benchmark compares Columnar's fused query with a hand-written typed-array loop and materializing JavaScript pipelines. The loop is a useful workload-specific reference; Columnar provides the reusable query model around filtering, null handling, aggregation and streaming. Run comparisons on the same machine and Node.js version.
 
 Each example can be opened as a StackBlitz project after `@columnar/core` is published to npm.
 

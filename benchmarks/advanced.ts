@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import { aggregateStream, col, count, max, mean, min, sum, table, variance } from '../src/index.js';
+import { countNulls } from '../src/memory/validity.js';
 
 const ROWS = 1_000_000;
 const ITERATIONS = 5;
@@ -261,6 +262,34 @@ for (const chunkSize of [1_024, 16_384, 65_536, 262_144]) {
   console.log(`${String(chunkSize).padStart(6)} rows/chunk: ${result.toFixed(2)} ms`);
 }
 
+console.log('\nValidity bitmap null counting');
+
+const validityRows = 10_000_000;
+const validity = new Uint32Array(Math.ceil(validityRows / 32));
+
+for (let wordIndex = 0; wordIndex < validity.length; wordIndex += 1) {
+  validity[wordIndex] = wordIndex % 7 === 0 ? 0x5555_5555 : 0xffff_ffff;
+}
+
+const remainingBits = validityRows & 31;
+
+if (remainingBits !== 0) {
+  validity[validity.length - 1] =
+    (validity[validity.length - 1] as number) & ((1 << remainingBits) - 1);
+}
+
+const expectedNullCount = countNullsKernighan(validity, validityRows);
+
+if (countNulls(validity, validityRows) !== expectedNullCount) {
+  throw new Error('Validity bitmap null-count implementations disagree.');
+}
+
+const bitmapPopcountDuration = await measure(() => countNulls(validity, validityRows));
+const bitClearingDuration = await measure(() => countNullsKernighan(validity, validityRows));
+
+console.log(`SWAR popcount: ${bitmapPopcountDuration.toFixed(2)} ms`);
+console.log(`Set-bit clearing: ${bitClearingDuration.toFixed(2)} ms`);
+
 async function measure(operation: () => number): Promise<number> {
   for (let index = 0; index < WARMUPS; index += 1) {
     operation();
@@ -393,4 +422,19 @@ function countOpcodeMatches(
   }
 
   return matches;
+}
+
+function countNullsKernighan(bitmap: Uint32Array, length: number): number {
+  let validCount = 0;
+
+  for (let wordIndex = 0; wordIndex < bitmap.length; wordIndex += 1) {
+    let word = bitmap[wordIndex] as number;
+
+    while (word !== 0) {
+      word &= word - 1;
+      validCount += 1;
+    }
+  }
+
+  return length - validCount;
 }

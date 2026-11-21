@@ -1,5 +1,5 @@
 {
-  "name": "@columnar/core",
+  "name": "@columnar-js/core",
   "version": "0.1.0",
   "description": "A typed-array-native, allocation-conscious data processing engine for JavaScript and TypeScript.",
   "license": "MIT",
